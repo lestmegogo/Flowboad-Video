@@ -396,6 +396,37 @@ async def test_retry_storyboard_shot_child_dispatches_edit_image(
 
 
 @pytest.mark.asyncio
+async def test_retry_storyboard_shot_forwards_ref_media_ids(client, monkeypatch):
+    """Regression — refs were silently dropped on retry because the frontend
+    didn't pass `ref_media_ids` and node.data.globalRefMediaIds was never
+    persisted. After the fix the frontend collects refs at retry time and
+    passes them via params; this test pins the worker side of that contract:
+    explicit ref_media_ids in params MUST reach the SDK call."""
+    node_id = _seed_storyboard_with_shots(
+        [
+            {
+                "idx": 0, "prompt": "p0", "parentShotIdx": None,
+                "mediaId": None, "status": "error", "error": "boom",
+            },
+        ]
+    )
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    refs = ["char-mid-1", "wardrobe-mid-1"]
+    out, err = await proc._handle_retry_storyboard_shot(
+        {
+            "shot_idx": 0,
+            "__node_id": node_id,
+            "ref_media_ids": refs,
+        }
+    )
+    assert err is None
+    assert len(sdk.gen_calls) == 1
+    assert sdk.gen_calls[0]["ref_media_ids"] == refs
+
+
+@pytest.mark.asyncio
 async def test_retry_storyboard_shot_child_rejects_when_parent_unhealthy(
     client, monkeypatch
 ):

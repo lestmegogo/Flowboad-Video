@@ -789,6 +789,11 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
 
     let reqDto;
     try {
+      // Refs are live — collect at retry time, not from a snapshot. If
+      // the user re-wired upstream edges since the original gen, the
+      // retry uses the new pool. Without this the retry runs ref-less
+      // and identity drifts (the whole reason for the storyboard).
+      const refMediaIds = collectUpstreamRefMediaIds(rfId);
       reqDto = await createRequest({
         type: "retry_storyboard_shot",
         node_id: isNaN(nodeDbId) ? undefined : nodeDbId,
@@ -800,6 +805,7 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             (node.data.aspectRatio as string | undefined) ??
             "IMAGE_ASPECT_RATIO_LANDSCAPE",
           image_model: useSettingsStore.getState().imageModel,
+          ref_media_ids: refMediaIds,
         },
       });
     } catch (err) {
