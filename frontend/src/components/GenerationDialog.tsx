@@ -226,6 +226,23 @@ export function GenerationDialog() {
   // We also surface the full `allVariants` list + the edge id so the
   // chip can offer a per-source variant picker without re-querying
   // the store on click.
+  // Prompt sources — text-only upstream nodes whose `prompt` feeds the
+  // auto-prompt synth as context. They have no mediaId so they live in a
+  // separate list from refSourceNodes; the dialog renders them as a
+  // text-only chip alongside image refs so the user can SEE that a
+  // Prompt node is influencing the gen.
+  const promptSourceNodes = !isVideo && rfId
+    ? edges
+        .filter((e) => e.target === rfId)
+        .map((e) => {
+          const n = nodes.find((node) => node.id === e.source);
+          if (!n || n.data.type !== "prompt") return null;
+          const text = typeof n.data.prompt === "string" ? n.data.prompt : "";
+          return { edgeId: e.id, node: n, text };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+    : [];
+
   const refSourceNodes = !isVideo && rfId
     ? edges
         .filter((e) => e.target === rfId)
@@ -848,13 +865,36 @@ export function GenerationDialog() {
           </div>
         )}
 
-        {/* Reference images (image only) */}
-        {!isVideo && refSourceNodes.length > 0 && (
+        {/* Source references — image refs (character/image/visual_asset/
+            Storyboard) AND prompt-text refs. Prompt nodes don't have
+            media but their text feeds the auto-prompt synth, so we
+            surface them as text chips next to the thumbnails. */}
+        {!isVideo && (refSourceNodes.length > 0 || promptSourceNodes.length > 0) && (
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
-              Source references ({refSourceNodes.length})
+              Source references ({refSourceNodes.length + promptSourceNodes.length})
             </span>
             <div className="ref-source-row">
+              {promptSourceNodes.map((p) => {
+                const preview = p.text.trim() || "(empty prompt)";
+                return (
+                  <div
+                    key={p.edgeId}
+                    className="ref-source-chip ref-source-chip--prompt"
+                    title={`${p.node.data.title || "Prompt"} — ${preview}`}
+                  >
+                    <div className="ref-source-chip__prompt-body">
+                      <span className="ref-source-chip__prompt-icon" aria-hidden="true">✦</span>
+                      <span className="ref-source-chip__prompt-text">
+                        {preview}
+                      </span>
+                    </div>
+                    <span className="ref-source-chip__id">
+                      #{p.node.data.shortId}
+                    </span>
+                  </div>
+                );
+              })}
               {refSourceNodes.map((r) => {
                 const isMulti = r.allVariants.length >= 2;
                 const isPickerOpen = openVariantPicker === r.edgeId;

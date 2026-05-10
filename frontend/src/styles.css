@@ -3712,6 +3712,46 @@ button:disabled {
   background: var(--panel);
 }
 
+/* Prompt source chip — text-only sibling of the image refs. Same
+   outer footprint (72px wide) so the chips line up in a single
+   ref-source-row; inner area is a text preview instead of a thumbnail. */
+.ref-source-chip--prompt {
+  cursor: default;
+}
+
+.ref-source-chip__prompt-body {
+  width: 64px;
+  height: 64px;
+  border-radius: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.ref-source-chip__prompt-icon {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--accent, #7c5cff);
+  flex-shrink: 0;
+}
+
+.ref-source-chip__prompt-text {
+  font-size: 9px;
+  line-height: 1.25;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+}
+
 /* Variant pin badge — surfaces which variant of a multi-variant
    source is bound to this edge, so the dialog/viewer preview shows
    the EXACT thumbnail Flow will receive at dispatch. */
