@@ -276,7 +276,14 @@ export function Board() {
 
   const onNodeDoubleClick = useCallback(
     (_event: React.MouseEvent, node: FlowNode) => {
-      const isGenerable = ["image", "prompt", "video", "visual_asset", "character"].includes(node.data.type);
+      const isGenerable = [
+        "image",
+        "prompt",
+        "video",
+        "visual_asset",
+        "character",
+        "Storyboard",
+      ].includes(node.data.type);
       if (!isGenerable) return;
       const s = useGenerationStore.getState();
       if (node.data.mediaId) {
@@ -313,7 +320,9 @@ export function Board() {
         .nodes.filter(
           (n) =>
             n.selected &&
-            ["image", "prompt", "video", "character"].includes(n.data.type),
+            ["image", "prompt", "video", "character", "Storyboard"].includes(
+              n.data.type,
+            ),
         );
       if (selectedNodes.length === 0) return;
       e.preventDefault();
