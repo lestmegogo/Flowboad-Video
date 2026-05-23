@@ -52,27 +52,29 @@ export function buildStoryboardPrompt(
   const { rows, cols, total } = resolveStoryboardLayout(grid, aspectRatio);
   const t = topic.trim() || "untitled story";
   // Verbose template — earlier short version produced overlapping borders
-  // (no clear panel separators) and no per-frame captions, so the result
+  // (no clear tile separators) and no per-tile captions, so the result
   // read like a montage instead of a storyboard. This version pins the
-  // layout, numbering, and caption rules so each panel is self-explanatory
+  // layout, numbering, and caption rules so each tile is self-explanatory
   // at a glance.
   //
-  // Intentionally STYLE-NEUTRAL — no medium hints ("comic-book", "manga",
-  // "comic art"), no font hints ("sans-serif"), no palette / cohesion
-  // clauses. Those override the upstream refs (character, visual_asset)
-  // that should drive the visual look, and add noise when no refs are
-  // attached. Only layout / numbering / caption rules remain — those are
-  // the actual non-negotiables for a readable storyboard.
+  // Intentionally STYLE-NEUTRAL — vocabulary chosen to avoid biasing the
+  // model toward illustration/comic medium. We keep the word "storyboard"
+  // (it's the user-facing label and a common neutral term) but drop
+  // illustration-coded words ("panel", "illustrates", "filled circle",
+  // "gutters", "scenes") that pulled Flow toward cartoon output even
+  // when source refs were real photos. Tile / shows / margin / number
+  // label are medium-agnostic. Only layout / numbering / caption rules
+  // remain — those are the actual non-negotiables for a readable grid.
   return [
-    `Create a visual storyboard for "${t}" as a SINGLE IMAGE`,
-    `arranged in a ${rows}x${cols} grid (${rows} rows, ${cols} columns, ${total} panels total).`,
-    `Each panel illustrates one beat of the story.`,
-    `Panels read left-to-right, top-to-bottom in narrative order (1 → ${total}).`,
+    `Create a visual storyboard for "${t}" as a SINGLE composite IMAGE`,
+    `arranged in a ${rows}x${cols} grid (${rows} rows, ${cols} columns, ${total} tiles total).`,
+    `Each tile shows one beat of the story.`,
+    `Tiles read left-to-right, top-to-bottom in narrative order (1 → ${total}).`,
     `STRICT layout rules:`,
-    `  • Clean WHITE GUTTERS between every panel — no overlapping borders, no bleed between scenes.`,
-    `  • Each panel is rectangular, identical size, sharply separated from its neighbors.`,
-    `  • In the TOP-LEFT corner of every panel, place a small filled CIRCLE with the panel NUMBER (1, 2, 3, …, ${total}) inside it — readable and consistent across all panels.`,
-    `  • BENEATH each panel (outside the picture area, in the white gutter), print a SHORT one-sentence CAPTION describing the action of that beat. Use clean, legible text. Captions in the same language as the topic.`,
+    `  • Clean WHITE MARGINS between every tile — no overlapping borders, no bleed between tiles.`,
+    `  • Each tile is rectangular, identical size, sharply separated from its neighbors.`,
+    `  • In the TOP-LEFT corner of every tile, place a small NUMBER label (1, 2, 3, …, ${total}) — readable and consistent across all tiles.`,
+    `  • BENEATH each tile (outside the picture area, in the white margin below), print a SHORT one-sentence caption describing the action of that beat. Use clean, legible text. Captions in the same language as the topic.`,
   ].join(" ");
 }
 
