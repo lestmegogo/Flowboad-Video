@@ -372,6 +372,7 @@ matching vocab from the system prompt.
 | **Python 3.11** | Agent runtime (FastAPI + SQLModel) |
 | **Node 20+** | Frontend dev server (Vite) |
 | **Chrome / Chromium** | **Mandatory** — hosts the MV3 extension that proxies every Google Flow API call. The agent has zero direct path to Flow without it. |
+| **FFmpeg** | Local Video Composer. On Windows run `powershell -ExecutionPolicy Bypass -File scripts/install-ffmpeg.ps1`; the binary is installed under `tools/ffmpeg/`. |
 | **One LLM CLI** on `PATH` | Vision describe + auto-prompt + planner. Pick one — defaults to **Claude Code** ([`@anthropic-ai/claude-code`](https://docs.claude.com/claude-code/install)); also supports **Gemini CLI** ([`@google/gemini-cli`](https://github.com/google-gemini/gemini-cli)) and **OpenAI Codex** ([`@openai/codex`](https://github.com/openai/codex), provider implemented but not yet smoke-tested). All use OAuth against your existing AI subscription — no API key needed. |
 | **Google Flow `Pro` or `Ultra` plan** at [`labs.google/fx/tools/flow`](https://labs.google/fx/tools/flow) | **Free tier and trial accounts will not work.** Veo 3.1 i2v + GEM_PIX_2 image gen are gated to paid plans. |
 
@@ -496,6 +497,12 @@ cd frontend && npx tsc -p . --noEmit && npx vite build
   - Motion synth uses time-coded beats so the model performs an
     editorial 2–3 pose-shift sequence inside the 8s clip — never a
     frozen statue.
+- **Video Composer** — connect 1–20 Video nodes (a single clip requires
+  background music), drag them into order,
+  normalize to 9:16 or 16:9, and render one local MP4 with FFmpeg. Keep
+  or mute original clip audio; optionally upload music and mix it with
+  independent original/music volume controls. Music loops or trims to
+  match the final duration. Composition is local and uses no Flow credits.
 
 ### Auto-prompt synthesis
 
@@ -663,3 +670,4 @@ The shared community for both **FlowKit** and **Flowboard**. Drop in to:
 - Trade tips on Google Flow plan limits, Veo i2v behaviour, and LLM CLI setup (Claude / Gemini / Codex)
 
 → **[facebook.com/groups/flowkit.flowboard.community](https://www.facebook.com/groups/flowkit.flowboard.community)**
+"# Flowboad-Video" 
