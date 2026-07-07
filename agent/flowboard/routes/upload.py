@@ -226,6 +226,11 @@ async def _ingest_image_bytes(
                 row.node_id = node_id
         s.add(row)
         s.commit()
+    from flowboard.services.media_project_sync import (
+        record_media_project_identity,
+    )
+
+    record_media_project_identity([media_id], project_id)
     out: dict = {"media_id": media_id, "mime": mime, "size": len(raw)}
     dims = _sniff_image_dimensions(raw)
     if dims is not None:

@@ -1,34 +1,26 @@
-"""Claude provider — thin LLMProvider wrapper around the existing
-``claude_cli`` subprocess module.
-
-Existing tested code paths in ``services/claude_cli.py`` stay untouched.
-This module just adapts that interface to the ``LLMProvider`` Protocol so
-the registry can dispatch to it through the unified surface.
-
-When the multi-LLM plan reaches Step 5 (migrate prompt_synth / vision /
-planner to use ``run_llm``), each call site stops importing claude_cli
-directly and goes through the registry. ``claude_cli`` itself remains
-as the subprocess implementation detail.
-
-**Error type contract**: callers using ``run_llm`` see ``LLMError`` (and
-nothing else) on failure. ``claude_cli.run_claude`` raises ``ClaudeCliError``
-which we translate here so the contract stays clean — without this wrap,
-a caller's ``except LLMError:`` would miss every Claude failure mode.
-"""
 from __future__ import annotations
 
+import base64
+import logging
+from pathlib import Path
 from typing import Optional
 
-from flowboard.services import claude_cli
+import httpx
 
-from .base import LLMError
+from .base import LLMError, image_mime_type
+from . import secrets
 
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TEXT_MODEL = "claude-3-5-sonnet-latest"
+_DEFAULT_VISION_MODEL = "claude-3-5-sonnet-latest"
+_MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024  # 5MB limit
 
 class ClaudeProvider:
     """Conforms to ``LLMProvider`` (structural typing — no inheritance)."""
 
     name: str = "claude"
-    supports_vision: bool = True  # Haiku 4.5 / Sonnet / Opus all have vision
+    supports_vision: bool = True
 
     async def run(
         self,
@@ -38,17 +30,90 @@ class ClaudeProvider:
         attachments: Optional[list[str]] = None,
         timeout: float = 90.0,
     ) -> str:
+        key = secrets.get_api_key("claude")
+        if not key:
+            raise LLMError("Claude API key not configured")
+
+        model = secrets.get_model("claude") or _DEFAULT_TEXT_MODEL
+
+        # Anthropic messages API payload
+        content = []
+        if attachments:
+            for path in attachments:
+                content.append(self._image_block(path))
+        content.append({"type": "text", "text": user_prompt})
+
+        payload = {
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
         try:
-            return await claude_cli.run_claude(
-                user_prompt,
-                system_prompt=system_prompt,
-                attachments=attachments,
-                timeout=timeout,
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise LLMError(f"Claude request timed out after {timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise LLMError(f"Claude transport error: {exc}") from exc
+
+        if resp.status_code != 200:
+            raise LLMError(
+                f"Claude HTTP {resp.status_code}: {self._safe_error_message(resp)}"
             )
-        except claude_cli.ClaudeCliError as exc:
-            # Preserve the original message + chain for diagnostics, but
-            # surface as LLMError so the contract holds for callers.
-            raise LLMError(str(exc)) from exc
+
+        try:
+            data = resp.json()
+            return data["content"][0]["text"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError(f"Claude response structure invalid: {exc}") from exc
 
     async def is_available(self) -> bool:
-        return await claude_cli.is_available()
+        return bool(secrets.get_api_key("claude"))
+
+    def _image_block(self, path: str) -> dict:
+        p = Path(path)
+        if not p.exists():
+            raise LLMError(f"Attachment file not found: {path}")
+        size = p.stat().st_size
+        if size > _MAX_ATTACHMENT_BYTES:
+            raise LLMError(
+                f"Attachment too large for Claude: "
+                f"{size // (1024 * 1024)}MB > 5MB limit"
+            )
+        mime = image_mime_type(p)
+        # Anthropic expects image/jpeg, image/png, image/gif, or image/webp
+        # Convert mime dynamically (if not supported, fallback to image/jpeg)
+        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if mime not in supported_mimes:
+            mime = "image/jpeg"
+        b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": b64
+            }
+        }
+
+    def _safe_error_message(self, resp: httpx.Response) -> str:
+        try:
+            body = resp.json()
+            if isinstance(body, dict) and "error" in body:
+                err = body["error"]
+                if isinstance(err, dict) and "message" in err:
+                    return err["message"]
+        except ValueError:
+            pass
+        return resp.text[:200]

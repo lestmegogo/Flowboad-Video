@@ -5,6 +5,7 @@ import { useGenerationStore } from "../store/generation";
 import { mediaUrl, patchEdge, patchNode, uploadImage, uploadImageFromUrl } from "../api/client";
 import { requestAutoBrief } from "../api/autoBrief";
 import { useReferencesStore } from "../store/references";
+import { useVideoComposerStore } from "../store/videoComposer";
 import {
   normaliseStoryboardGrid,
   resolveStoryboardLayout,
@@ -17,6 +18,7 @@ const ICON: Record<string, string> = {
   prompt: "✦",
   note: "✎",
   visual_asset: "◇",
+  video_composer: "⏩",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -1453,6 +1455,71 @@ function StoryboardBody({ rfId, data }: { rfId: string; data: FlowboardNodeData 
   );
 }
 
+function VideoComposerBody({
+  rfId,
+  data,
+}: {
+  rfId: string;
+  data: FlowboardNodeData;
+}) {
+  const edges = useBoardStore((state) => state.edges);
+  const nodes = useBoardStore((state) => state.nodes);
+  const clipCount = edges.filter((edge) => {
+    if (edge.target !== rfId) return false;
+    return nodes.find((node) => node.id === edge.source)?.data.type === "video";
+  }).length;
+  const isProcessing = data.status === "queued" || data.status === "running";
+  const progress = Math.max(
+    0,
+    Math.min(100, Math.round(data.assemblyProgress ?? 0)),
+  );
+
+  return (
+    <div className="node-body video-composer-node">
+      {data.mediaId ? (
+        <video
+          src={mediaUrl(data.mediaId)}
+          muted
+          preload="metadata"
+          onDoubleClick={(event) => event.stopPropagation()}
+        />
+      ) : (
+        <div className="video-composer-node__empty">
+          {clipCount < 1
+            ? "Connect at least 1 video"
+            : isProcessing
+              ? `Composing… ${progress}%`
+              : clipCount === 1
+                ? "1 clip ready — add music"
+                : `${clipCount} clips ready`}
+        </div>
+      )}
+      {isProcessing && (
+        <div
+          className="video-composer-node__progress"
+          role="progressbar"
+          aria-label="Video composition progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progress}
+        >
+          <span style={{ width: `${progress}%` }} />
+        </div>
+      )}
+      <button
+        type="button"
+        className="visual-asset__action"
+        onClick={(event) => {
+          event.stopPropagation();
+          useVideoComposerStore.getState().openComposer(rfId);
+        }}
+      >
+        {data.mediaId ? "Open composer" : "Configure"}
+      </button>
+    </div>
+  );
+}
+
 function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
   switch (data.type) {
     case "character":
@@ -1469,24 +1536,38 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <VisualAssetBody rfId={rfId} data={data} />;
     case "Storyboard":
       return <StoryboardBody rfId={rfId} data={data} />;
+    case "video_composer":
+      return <VideoComposerBody rfId={rfId} data={data} />;
   }
 }
 
 function downloadExt(type: string): string {
-  if (type === "video") return "mp4";
+  if (type === "video" || type === "video_composer") return "mp4";
   return "png";
 }
 
 export function NodeCard(props: NodeProps<FlowNode>) {
   const data = props.data;
   const isNote = data.type === "note";
-  const isGenerable = ["image", "prompt", "video", "visual_asset", "character", "Storyboard"].includes(data.type);
+  const isGenerable = [
+    "image",
+    "prompt",
+    "video",
+    "visual_asset",
+    "character",
+    "Storyboard",
+    "video_composer",
+  ].includes(data.type);
   const isRunning = data.status === "running";
   const llmBusy = isLLMBusy(data);
   const downloadable = !!data.mediaId && data.type !== "prompt" && data.type !== "note";
 
   function handleGenerate(e: React.MouseEvent) {
     e.stopPropagation();
+    if (data.type === "video_composer") {
+      useVideoComposerStore.getState().openComposer(props.id);
+      return;
+    }
     if (llmBusy) return; // guard: backend still composing for this node
     useGenerationStore.getState().openGenerationDialog(props.id, data.prompt ?? "");
   }
@@ -1519,6 +1600,11 @@ export function NodeCard(props: NodeProps<FlowNode>) {
       a.click();
       a.remove();
     });
+  }
+
+  function handleDelete(e: React.MouseEvent) {
+    e.stopPropagation();
+    void useBoardStore.getState().deleteNodeByRfId(props.id);
   }
 
   return (
@@ -1565,6 +1651,16 @@ export function NodeCard(props: NodeProps<FlowNode>) {
               ▶
             </button>
           )}
+          <button
+            className="node-header__btn node-header__btn--danger"
+            onClick={handleDelete}
+            aria-label="Delete node"
+            title="Delete node"
+            tabIndex={0}
+            type="button"
+          >
+            ×
+          </button>
         </div>
         <span className="node-short-id">#{data.shortId}</span>
       </div>

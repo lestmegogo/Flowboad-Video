@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -12,27 +13,19 @@ from . import secrets
 
 logger = logging.getLogger(__name__)
 
-_API_URL = "https://api.openai.com/v1/chat/completions"
-_DEFAULT_TEXT_MODEL = "gpt-4o"
-_DEFAULT_VISION_MODEL = "gpt-4o"
+_DEFAULT_ENDPOINT = "http://localhost:20128/v1/chat/completions"
+_DEFAULT_TEXT_MODEL = "kr/claude-sonnet-4.5"
+_DEFAULT_VISION_MODEL = "kr/claude-sonnet-4.5"
 _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10MB limit
 
-class OpenAIProvider:
-    """Conforms to ``LLMProvider``. REST API dispatch."""
-
-    name: str = "openai"
+class NineRouterProvider:
+    name: str = "nine_router"
     supports_vision: bool = True
 
-    def __init__(self) -> None:
-        self._api_cached_at: Optional[float] = None
-        self._api_value: Optional[bool] = None
-
-    def reset_cache(self) -> None:
-        self._api_cached_at = None
-        self._api_value = None
-
     async def is_available(self) -> bool:
-        return bool(secrets.get_api_key("openai"))
+        """9Router is available if a key is stored.
+        We don't ping here to prevent startup lag."""
+        return bool(secrets.get_api_key("nine_router"))
 
     async def run(
         self,
@@ -40,14 +33,16 @@ class OpenAIProvider:
         *,
         system_prompt: Optional[str] = None,
         attachments: Optional[list[str]] = None,
-        timeout: float = 90.0,
-        model: Optional[str] = None,
+        timeout: float = 300.0,
     ) -> str:
-        key = secrets.get_api_key("openai")
+        key = secrets.get_api_key("nine_router")
         if not key:
-            raise LLMError("OpenAI API key not configured")
+            raise LLMError("9Router API key not configured")
 
-        chosen_model = model or secrets.get_model("openai") or (
+        endpoint = os.environ.get("FLOWBOARD_NINE_ROUTER_ENDPOINT") or _DEFAULT_ENDPOINT
+        
+        # Look up the model name configured for nine_router in secrets, fallback to env or default
+        model = secrets.get_model("nine_router") or os.environ.get("FLOWBOARD_NINE_ROUTER_MODEL") or (
             _DEFAULT_VISION_MODEL if attachments else _DEFAULT_TEXT_MODEL
         )
 
@@ -63,12 +58,12 @@ class OpenAIProvider:
         else:
             messages.append({"role": "user", "content": user_prompt})
 
-        payload = {"model": chosen_model, "messages": messages}
+        payload = {"model": model, "messages": messages, "stream": False}
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
-                    _API_URL,
+                    endpoint,
                     headers={
                         "authorization": f"Bearer {key}",
                         "content-type": "application/json",
@@ -76,51 +71,52 @@ class OpenAIProvider:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
-            raise LLMError(f"OpenAI request timed out after {timeout}s") from exc
+            raise LLMError(f"9Router request timed out after {timeout}s") from exc
         except httpx.HTTPError as exc:
-            raise LLMError(f"OpenAI transport error: {exc}") from exc
+            raise LLMError(f"9Router transport error: {exc}") from exc
 
         if resp.status_code != 200:
             raise LLMError(
-                f"OpenAI HTTP {resp.status_code}: {self._safe_error_message(resp)}"
+                f"9Router HTTP {resp.status_code}: {self._safe_error_message(resp)}"
             )
 
         try:
             data = resp.json()
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise LLMError(f"OpenAI response missing content: {exc}") from exc
+            raise LLMError(f"9Router response missing content: {exc}") from exc
 
     async def list_models(self) -> list[str]:
-        """Fetch available models from OpenAI API."""
-        key = secrets.get_api_key("openai")
+        """Fetch active model IDs and combos from 9Router proxy."""
+        key = secrets.get_api_key("nine_router")
         if not key:
             return [_DEFAULT_TEXT_MODEL]
+
+        endpoint = os.environ.get("FLOWBOARD_NINE_ROUTER_ENDPOINT") or _DEFAULT_ENDPOINT
+        # Deduce the models endpoint from the completions endpoint (http://localhost:20128/v1/models)
+        base_url = endpoint.replace("/chat/completions", "")
+        models_url = f"{base_url}/models"
 
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(
-                    "https://api.openai.com/v1/models",
+                    models_url,
                     headers={"authorization": f"Bearer {key}"}
                 )
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, dict) and "data" in data:
-                        # Extract model IDs and sort them
                         models = [
                             m["id"]
                             for m in data["data"]
                             if isinstance(m, dict) and "id" in m
                         ]
-                        # Prioritize popular GPT models
-                        gpt_models = [m for m in models if m.startswith("gpt-")]
-                        if gpt_models:
-                            return sorted(gpt_models)
-                        return sorted(models)
+                        if models:
+                            return models
         except Exception as exc:
-            logger.warning("Failed to fetch models from OpenAI: %s", exc)
+            logger.warning("Failed to fetch models from 9Router: %s", exc)
 
-        return [_DEFAULT_TEXT_MODEL, "gpt-4o-mini", "o1-mini", "o3-mini"]
+        return [_DEFAULT_TEXT_MODEL]
 
     def _image_url_block(self, path: str) -> dict:
         p = Path(path)
@@ -129,7 +125,7 @@ class OpenAIProvider:
         size = p.stat().st_size
         if size > _MAX_ATTACHMENT_BYTES:
             raise LLMError(
-                f"Attachment too large for OpenAI: "
+                f"Attachment too large for 9Router: "
                 f"{size // (1024 * 1024)}MB > 10MB limit"
             )
         mime = image_mime_type(p)
@@ -148,6 +144,8 @@ class OpenAIProvider:
                     msg = err.get("message")
                     if isinstance(msg, str):
                         return msg[:200]
+                elif isinstance(err, str):
+                    return err[:200]
         except ValueError:
             pass
         return resp.text[:200]

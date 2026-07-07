@@ -302,9 +302,15 @@ function sendToAgent(msg) {
 async function handleApiRequest(msg) {
   const { id, params } = msg;
   const { url, method, headers, body, captchaAction } = params || {};
+  const startedAt = Date.now();
+  const timings = {};
+  const finishTimings = () => ({
+    ...timings,
+    totalMs: Date.now() - startedAt,
+  });
 
   if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) {
-    sendToAgent({ id, status: 400, error: 'INVALID_URL' });
+    sendToAgent({ id, status: 400, error: 'INVALID_URL', timings: finishTimings() });
     return;
   }
 
@@ -321,27 +327,40 @@ async function handleApiRequest(msg) {
   });
 
   try {
-    // Step 0: Fail fast if we have no bearer token. Avoids burning a reCAPTCHA
-    // solve (rate-limited + single-use) only to discover later that we can't
-    // send the request.
+    // Step 0: Recover a missing bearer token before solving reCAPTCHA.
+    // A fresh background Flow tab obtains current OAuth credentials without
+    // reloading the user's working project tab.
     if (!flowKey) {
-      sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
-      chrome.storage.local.set({ metrics });
-      updateRequestLog(id, { status: 'failed', error: 'NO_FLOW_KEY' });
-      setState('idle');
-      return;
+      const authStartedAt = Date.now();
+      const refresh = await refreshFlowAuthentication();
+      timings.authRefreshMs = Date.now() - authStartedAt;
+      if (!refresh.ok) {
+        const error = `FLOW_AUTH_REQUIRED: ${refresh.error || 'NO_FLOW_KEY'}`;
+        sendToAgent({ id, status: 503, error, timings: finishTimings() });
+        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = error; }
+        chrome.storage.local.set({ metrics });
+        updateRequestLog(id, { status: 'failed', error });
+        setState('idle');
+        return;
+      }
     }
 
     // Step 1: Solve captcha if needed
     let captchaToken = null;
     if (captchaAction) {
+      const captchaStartedAt = Date.now();
       const captchaResult = await solveCaptcha(id, captchaAction);
+      timings.captchaMs = Date.now() - captchaStartedAt;
       captchaToken = captchaResult?.token || null;
       if (!captchaToken) {
         const err = captchaResult?.error || 'CAPTCHA_FAILED';
         console.error(`[Flowboard] Captcha failed for ${captchaAction}: ${err}`);
-        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
+        sendToAgent({
+          id,
+          status: 403,
+          error: `CAPTCHA_FAILED: ${err}`,
+          timings: finishTimings(),
+        });
         if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
         chrome.storage.local.set({ metrics });
         updateRequestLog(id, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
@@ -368,12 +387,14 @@ async function handleApiRequest(msg) {
 
     const fetchHeaders = { ...(headers || {}), authorization: `Bearer ${flowKey}` };
 
+    const fetchStartedAt = Date.now();
     const response = await fetch(url, {
       method:      method || 'POST',
       headers:     fetchHeaders,
       credentials: 'include',
       body:        method === 'GET' ? undefined : JSON.stringify(finalBody),
     });
+    timings.fetchMs = Date.now() - fetchStartedAt;
 
     const responseText = await response.text();
     let responseData;
@@ -383,7 +404,33 @@ async function handleApiRequest(msg) {
       responseData = responseText;
     }
 
-    sendToAgent({ id, status: response.status, data: responseData });
+    if (isAuthenticationFailure(response.status, responseData)) {
+      const authStartedAt = Date.now();
+      const refresh = await refreshFlowAuthentication();
+      timings.authRefreshMs = (timings.authRefreshMs || 0) + (Date.now() - authStartedAt);
+      const error = refresh.ok
+        ? 'AUTH_REFRESHED_RETRY'
+        : `FLOW_AUTH_REQUIRED: ${refresh.error || 'TOKEN_REFRESH_FAILED'}`;
+      sendToAgent({
+        id,
+        status: 503,
+        error,
+        data: responseData,
+        timings: finishTimings(),
+      });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = error; }
+      updateRequestLog(id, { status: 'failed', httpStatus: response.status, error });
+      chrome.storage.local.set({ metrics });
+      setState('idle');
+      return;
+    }
+
+    sendToAgent({
+      id,
+      status: response.status,
+      data: responseData,
+      timings: finishTimings(),
+    });
 
     if (response.ok) {
       if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
@@ -393,7 +440,12 @@ async function handleApiRequest(msg) {
       updateRequestLog(id, { status: 'failed', httpStatus: response.status, error: `API_${response.status}` });
     }
   } catch (e) {
-    sendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
+    sendToAgent({
+      id,
+      status: 500,
+      error: e.message || 'API_REQUEST_FAILED',
+      timings: finishTimings(),
+    });
     if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message || 'API_REQUEST_FAILED'; }
     updateRequestLog(id, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
   }
@@ -431,24 +483,32 @@ async function openFlowTabResilient(active = false) {
   }
 }
 
-async function captureTokenFromFlowTab() {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-  });
+async function captureTokenFromFlowTab({
+  forceNewTab = false,
+  waitForToken = false,
+} = {}) {
+  const startedAt = Date.now();
+  let tabs = await chrome.tabs.query({ url: flowUrls });
 
-  if (!tabs.length) {
-    if (_openingFlowTab) return;
+  if (forceNewTab || !tabs.length) {
+    if (_openingFlowTab) {
+      return { ok: false, error: 'FLOW_TAB_OPEN_IN_PROGRESS' };
+    }
     _openingFlowTab = true;
     try {
       console.log('[Flowboard] No Flow tab — opening in background');
       await openFlowTabResilient(false);
     } catch (e) {
       console.error('[Flowboard] Failed to open Flow tab:', e);
+      return { ok: false, error: e?.message || 'NO_FLOW_TAB' };
     } finally {
       _openingFlowTab = false;
     }
-    return;
+    await sleep(3000);
+    tabs = await chrome.tabs.query({ url: flowUrls });
   }
+
+  if (!tabs.length) return { ok: false, error: 'NO_FLOW_TAB' };
 
   try {
     // Trigger a credentialed request so the page re-issues an Authorization header
@@ -459,7 +519,52 @@ async function captureTokenFromFlowTab() {
     console.log('[Flowboard] Token refresh triggered on Flow tab');
   } catch (e) {
     console.error('[Flowboard] Token refresh failed:', e);
+    if (!waitForToken) {
+      return { ok: false, error: e?.message || 'TOKEN_REFRESH_FAILED' };
+    }
   }
+
+  if (waitForToken) {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      if (
+        flowKey &&
+        metrics.tokenCapturedAt &&
+        metrics.tokenCapturedAt >= startedAt
+      ) {
+        return { ok: true };
+      }
+      await sleep(250);
+    }
+    return { ok: false, error: 'TOKEN_REFRESH_TIMEOUT' };
+  }
+  return { ok: true };
+}
+
+function isAuthenticationFailure(status, data) {
+  if (status === 401) return true;
+  if (status !== 403) return false;
+  let text = '';
+  try {
+    text = JSON.stringify(data || '').toLowerCase();
+  } catch {
+    text = String(data || '').toLowerCase();
+  }
+  return (
+    text.includes('invalid authentication credentials') ||
+    text.includes('unauthenticated') ||
+    text.includes('oauth 2 access token')
+  );
+}
+
+async function refreshFlowAuthentication() {
+  flowKey = null;
+  metrics.tokenCapturedAt = null;
+  await chrome.storage.local.remove('flowKey');
+  return captureTokenFromFlowTab({
+    forceNewTab: true,
+    waitForToken: true,
+  });
 }
 
 // ─── reCAPTCHA Solving ──────────────────────────────────────
@@ -599,18 +704,72 @@ async function handleTrpcRequest(msg) {
   // TRPC calls are silent — don't add to request log, don't bump metrics
 
   const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
-  if (flowKey) {
-    fetchHeaders['authorization'] = `Bearer ${flowKey}`;
-  }
 
   try {
-    const resp = await fetch(url, {
-      method,
-      headers: fetchHeaders,
-      body:    body ? JSON.stringify(body) : undefined,
-      credentials: 'include',
-    });
-    const data = await resp.json();
+    if (!flowKey) {
+      const refresh = await refreshFlowAuthentication();
+      if (!refresh.ok) {
+        sendToAgent({
+          id,
+          status: 503,
+          error: `FLOW_AUTH_REQUIRED: ${refresh.error || 'NO_FLOW_KEY'}`,
+        });
+        return;
+      }
+    }
+
+    const performRequest = async () => {
+      const requestHeaders = {
+        ...fetchHeaders,
+        authorization: `Bearer ${flowKey}`,
+      };
+      const resp = await fetch(url, {
+        method,
+        headers: requestHeaders,
+        body: body ? JSON.stringify(body) : undefined,
+        credentials: 'include',
+      });
+      const contentType = resp.headers.get('content-type') || '';
+      let data;
+      if (
+        resp.ok &&
+        resp.redirected &&
+        resp.url !== url &&
+        !contentType.includes('application/json')
+      ) {
+        // media.getMediaUrlRedirect follows to a short-lived signed CDN URL.
+        // Return the URL only; do not read the video body into extension memory.
+        data = {
+          redirectUrl: resp.url,
+          contentType,
+        };
+      } else {
+        try {
+          data = await resp.json();
+        } catch {
+          data = {
+            contentType,
+            redirectUrl: resp.ok && resp.url !== url ? resp.url : null,
+          };
+        }
+      }
+      return { resp, data };
+    };
+
+    let { resp, data } = await performRequest();
+    if (isAuthenticationFailure(resp.status, data)) {
+      const refresh = await refreshFlowAuthentication();
+      if (!refresh.ok) {
+        sendToAgent({
+          id,
+          status: 503,
+          error: `FLOW_AUTH_REQUIRED: ${refresh.error || 'TOKEN_REFRESH_FAILED'}`,
+          data,
+        });
+        return;
+      }
+      ({ resp, data } = await performRequest());
+    }
     sendToAgent({ id, status: resp.status, data });
   } catch (e) {
     console.error('[Flowboard] tRPC request failed:', e);

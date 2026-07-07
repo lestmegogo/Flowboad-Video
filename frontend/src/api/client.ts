@@ -7,7 +7,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!res.ok) {
-    throw new Error(`${res.status} ${res.statusText}`);
+    throw new Error(await extractErrorMessage(res));
   }
   return res.json() as Promise<T>;
 }
@@ -101,6 +101,7 @@ export interface WsStats {
 export interface HealthResponse {
   ok: boolean;
   extension_connected: boolean;
+  ffmpeg_available?: boolean;
   ws_stats?: WsStats;
 }
 
@@ -110,7 +111,15 @@ export function getHealth() {
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard";
+export type NodeType =
+  | "character"
+  | "image"
+  | "video"
+  | "prompt"
+  | "note"
+  | "visual_asset"
+  | "Storyboard"
+  | "video_composer";
 export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 
 export interface Board {
@@ -422,6 +431,40 @@ export function getRequest(id: number) {
   return api<RequestDTO>(`/api/requests/${id}`);
 }
 
+export interface VideoComposerCapabilities {
+  ffmpeg_available: boolean;
+  max_clips: number;
+  max_audio_bytes: number;
+}
+
+export function getVideoComposerCapabilities() {
+  return api<VideoComposerCapabilities>("/api/video-composer/capabilities");
+}
+
+export interface ComposerAudioUpload {
+  media_id: string;
+  filename: string;
+  mime: string;
+  size: number;
+}
+
+export async function uploadComposerAudio(
+  file: File,
+  nodeId: number,
+): Promise<ComposerAudioUpload> {
+  const form = new FormData();
+  form.append("node_id", String(nodeId));
+  form.append("file", file);
+  const response = await fetch("/api/video-composer/upload-audio", {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await extractErrorMessage(response));
+  }
+  return response.json() as Promise<ComposerAudioUpload>;
+}
+
 // ── Plans + Pipeline runs ────────────────────────────────────────────────────
 
 export interface PipelineRunDTO {
@@ -575,7 +618,7 @@ export async function uploadImageFromUrl(
 // See .omc/plans/multi-llm-provider-legacy.md → UI Specification → Frontend ↔
 // backend contract for the full shape.
 
-export type LLMProviderName = "claude" | "gemini" | "openai";
+export type LLMProviderName = "claude" | "gemini" | "openai" | "nine_router";
 export type LLMFeature = "auto_prompt" | "vision" | "planner";
 export type LLMProviderMode = "cli" | "api" | "none";
 export type LLMLastError =
@@ -592,6 +635,7 @@ export interface LLMProviderInfo {
   configured: boolean;
   requiresKey: boolean;
   mode: LLMProviderMode;
+  selectedModel?: string | null;
   lastError?: LLMLastError;
   lastTest?: { ok: boolean; latencyMs?: number; error?: string };
 }
@@ -650,6 +694,27 @@ export async function setLlmApiKey(
   return res.json();
 }
 
+export async function setLlmModel(
+  name: LLMProviderName,
+  model: string | null,
+): Promise<{ ok: boolean }> {
+  const res = await fetch(`/api/llm/providers/${name}/model`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  if (!res.ok) throw new Error(await extractErrorMessage(res));
+  return res.json();
+}
+
+export async function getLlmProviderModels(
+  name: LLMProviderName,
+): Promise<string[]> {
+  const res = await fetch(`/api/llm/providers/${name}/models`);
+  if (!res.ok) throw new Error(`getLlmProviderModels: ${res.status}`);
+  return res.json() as Promise<string[]>;
+}
+
 export interface LlmTestResult {
   ok: boolean;
   latencyMs?: number;
@@ -678,7 +743,7 @@ export async function testLlmProvider(
 export type ActivityType =
   | "auto_prompt" | "auto_prompt_batch"
   | "vision" | "planner"
-  | "gen_image" | "gen_video" | "edit_image"
+  | "gen_image" | "gen_video" | "edit_image" | "compose_video"
   | "upload" | "upload_url";
 export type ActivityStatus = "queued" | "running" | "done" | "failed";
 

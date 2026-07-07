@@ -13,6 +13,7 @@ from flowboard.db.models import (
     PipelineRun,
     Plan,
     PlanRevision,
+    Reference,
     Request,
 )
 
@@ -107,6 +108,15 @@ def delete_board(board_id: int):
         s.exec(sql_delete(Plan).where(Plan.board_id == board_id))
         s.exec(sql_delete(ChatMessage).where(ChatMessage.board_id == board_id))
         s.exec(sql_delete(BoardFlowProject).where(BoardFlowProject.board_id == board_id))
+        # References are saved library items, not board-owned rows. Detach
+        # the nullable provenance FK so deleting the source board does not
+        # destroy the user's saved media/reference.
+        references = s.exec(
+            select(Reference).where(Reference.source_board_id == board_id)
+        ).all()
+        for ref in references:
+            ref.source_board_id = None
+            s.add(ref)
         s.delete(board)
         s.commit()
         return {"deleted": board_id}

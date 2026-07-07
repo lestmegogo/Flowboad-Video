@@ -53,6 +53,7 @@ def test_delete_board_cascades_children(client):
         PipelineRun,
         Plan,
         PlanRevision,
+        Reference,
         Request,
     )
     from sqlmodel import select
@@ -85,6 +86,15 @@ def test_delete_board_cascades_children(client):
         s.add(PlanRevision(plan_id=plan.id, rev_no=1, spec={}, edits={}))
         s.add(PipelineRun(plan_id=plan.id, status="pending"))
         s.add(BoardFlowProject(board_id=bid, flow_project_id="fpfpfpfp"))
+        s.add(
+            Reference(
+                media_id="22222222-3333-4444-5555-666666666666",
+                kind="image",
+                label="saved reference",
+                source_board_id=bid,
+                source_node_short_id=n1["short_id"],
+            )
+        )
         s.commit()
 
     # Delete.
@@ -109,6 +119,13 @@ def test_delete_board_cascades_children(client):
         # Asset / Request reference node_id, which no longer exists.
         assert s.exec(select(Asset).where(Asset.node_id.in_([n1["id"], n2["id"]]))).all() == []
         assert s.exec(select(Request).where(Request.node_id.in_([n1["id"], n2["id"]]))).all() == []
+        refs = s.exec(
+            select(Reference).where(
+                Reference.media_id == "22222222-3333-4444-5555-666666666666"
+            )
+        ).all()
+        assert len(refs) == 1
+        assert refs[0].source_board_id is None
 
 
 def test_delete_missing_board_returns_404(client):

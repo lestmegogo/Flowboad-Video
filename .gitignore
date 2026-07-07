@@ -46,3 +46,5 @@ coverage/
 # comments as source-of-truth, but contains raw OAuth bearer tokens.
 # Keep on disk; never commit.
 /video_model*.md
+# Local FFmpeg bundle installed by scripts/install-ffmpeg.ps1
+tools/ffmpeg/

@@ -4,6 +4,9 @@ import {
   getLlmProviders,
   setLlmConfig,
   testLlmProvider,
+  setLlmApiKey,
+  setLlmModel,
+  getLlmProviderModels,
   type LLMConfig,
   type LLMProviderInfo,
   type LLMProviderName,
@@ -13,66 +16,14 @@ import { ProviderSetupModal } from "./ProviderSetupModal";
 
 /**
  * Single-provider model — one AI provider serves all 3 features
- * (Auto-Prompt / Vision / Planner). User picks one card, runs ONE
- * connection test, then Apply commits the change to all 3 features.
- *
- * Why one test instead of three: in single-provider mode, the 3 tests
- * were 3 identical pings against the same endpoint with the same
- * prompt. Running them in parallel triggered Google's per-user
- * MODEL_CAPACITY_EXHAUSTED 429s on Gemini (the first call wins, the
- * other two retry-wait and often time out at 120s). Running them in
- * series is wasteful and slow. One ping is sufficient — if the provider
- * answers `.` once, all 3 dispatch paths can use it.
- *
- * CLI-only philosophy: only OAuth-CLI providers are surfaced
- * (Claude / Gemini / OpenAI Codex). xAI Grok was considered but never
- * shipped an end-user CLI, so it was dropped from both UI and backend.
- *
- * Layout:
- *   1. Cards row — 3 OAuth provider cards
- *   2. Selection panel (visible only after a card is selected) —
- *      either inline setup (Setup help link) when the provider isn't
- *      ready, OR the connection test + Apply button when ready.
- *
- * Backend support: setLlmConfig accepts partial updates; we always send
- * all 3 features pointed at the same provider. The backend keeps its
- * per-feature routing capability so future power-user surfaces can opt
- * into the granular model — this dialog just constrains it for clarity.
+ * (Auto-Prompt / Vision / Planner). User picks one card, configures key/model,
+ * runs ONE connection test, then Apply commits the change to all 3 features.
  */
 
 const REFRESH_INTERVAL_MS = 30_000;
-// Order matters — this is the left-to-right card order in the dialog.
-// Gemini first (Google's most popular CLI), Claude middle, OpenAI Codex last.
-const SHOWN_PROVIDERS: LLMProviderName[] = ["gemini", "claude", "openai"];
-// First-run default selection. Gemini wins because it's free for personal
-// use, has the lowest CLI install friction, and (on a configured machine)
-// passes the test gate fastest. The user can still click any other card —
-// this just gives them a sensible starting point instead of a blank panel.
+const SHOWN_PROVIDERS: LLMProviderName[] = ["gemini", "claude", "openai", "nine_router"];
 const FIRST_RUN_DEFAULT: LLMProviderName = "gemini";
 
-// CLI install reference — shown as a footer under the test checklist so
-// users know how to upgrade / reinstall the CLI without leaving the
-// dialog. Docs URL points at the official repo / quickstart for each.
-const CLI_REFERENCE: Record<
-  LLMProviderName,
-  { installCmd: string; docsUrl: string; docsLabel: string }
-> = {
-  claude: {
-    installCmd: "npm install -g @anthropic-ai/claude-code",
-    docsUrl: "https://docs.anthropic.com/en/docs/claude-code/quickstart",
-    docsLabel: "Anthropic docs",
-  },
-  gemini: {
-    installCmd: "npm install -g @google/gemini-cli",
-    docsUrl: "https://github.com/google-gemini/gemini-cli",
-    docsLabel: "Gemini CLI repo",
-  },
-  openai: {
-    installCmd: "npm install -g @openai/codex",
-    docsUrl: "https://github.com/openai/codex",
-    docsLabel: "Codex CLI repo",
-  },
-};
 type TestState = "untested" | "testing" | "ok" | "fail";
 interface ConnectionTestResult {
   state: TestState;
@@ -83,9 +34,6 @@ interface ConnectionTestResult {
 const INITIAL_TEST: ConnectionTestResult = { state: "untested" };
 
 function deriveCurrent(config: LLMConfig | null): LLMProviderName | null {
-  // "Current active provider" = the one all 3 features point at. Any
-  // null slot or any divergence (legacy mixed config / partial pick)
-  // returns null so the UI prompts the user to consolidate.
   if (!config) return null;
   const a = config.auto_prompt;
   if (a === null) return null;
@@ -100,10 +48,14 @@ export function AiProvidersSection() {
   const [config, setConfig] = useState<LLMConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // The card the user has clicked (their pending selection). Defaults
-  // to whatever's currently active so opening the dialog doesn't show
-  // a blank state.
   const [pending, setPending] = useState<LLMProviderName | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [customModelInput, setCustomModelInput] = useState("");
+  const [showCustomInput, setShowCustomInput] = useState(false);
+
   const [test, setTest] = useState<ConnectionTestResult>(INITIAL_TEST);
   const [applying, setApplying] = useState(false);
   const [helpFor, setHelpFor] = useState<LLMProviderName | null>(null);
@@ -130,7 +82,7 @@ export function AiProvidersSection() {
     }
   }, []);
 
-  // Initial load + 30s polling, visibility-aware.
+  // Initial load + 30s polling
   useEffect(() => {
     void refresh();
     const interval = setInterval(() => {
@@ -146,14 +98,6 @@ export function AiProvidersSection() {
     };
   }, [refresh]);
 
-  // Once the first /config arrives, seed the pending selection. Two
-  // cases:
-  //   - User already has a configured provider → seed with it so Apply
-  //     is a no-op until they pick something different.
-  //   - Fresh install (no current) → seed with FIRST_RUN_DEFAULT (Gemini)
-  //     so the panel opens with one card pre-selected and the user sees
-  //     the next-step CTA (Setup help OR test list) immediately, instead
-  //     of a blank state that hides what to do next.
   const current = deriveCurrent(config);
   useEffect(() => {
     if (pending !== null || config === null) return;
@@ -164,6 +108,45 @@ export function AiProvidersSection() {
     }
   }, [current, pending, config]);
 
+  const pendingProvider = pending && providers ? providers.find((p) => p.name === pending) : null;
+
+  // Load models for pending provider when configured status changes
+  useEffect(() => {
+    if (!pending || !pendingProvider?.configured) {
+      setModels([]);
+      setSelectedModel("");
+      setShowCustomInput(false);
+      return;
+    }
+
+    setLoadingModels(true);
+    getLlmProviderModels(pending)
+      .then((list) => {
+        if (!aliveRef.current) return;
+        setModels(list);
+
+        const activeModel = pendingProvider.selectedModel;
+        if (activeModel) {
+          setSelectedModel(activeModel);
+          if (!list.includes(activeModel)) {
+            setShowCustomInput(true);
+            setCustomModelInput(activeModel);
+          } else {
+            setShowCustomInput(false);
+          }
+        } else if (list.length > 0) {
+          setSelectedModel(list[0]);
+          void handleSaveModel(list[0]);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to load models:", err);
+      })
+      .finally(() => {
+        if (aliveRef.current) setLoadingModels(false);
+      });
+  }, [pending, pendingProvider?.configured, pendingProvider?.selectedModel]);
+
   function showToast(msg: string) {
     setToast(msg);
     setTimeout(() => setToast(null), 4000);
@@ -172,9 +155,52 @@ export function AiProvidersSection() {
   function handleSelect(name: LLMProviderName) {
     if (name === pending) return;
     setPending(name);
-    // Switching the candidate provider invalidates any prior test
-    // result — it was against a different target.
+    setApiKeyInput("");
+    setCustomModelInput("");
+    setShowCustomInput(false);
     setTest(INITIAL_TEST);
+  }
+
+  async function handleSaveKey() {
+    if (!pending || !apiKeyInput) return;
+    try {
+      await setLlmApiKey(pending, apiKeyInput);
+      showToast(`API Key saved for ${labelOf(pending)}.`);
+      setApiKeyInput("");
+      await refresh();
+    } catch (err) {
+      showToast(`Failed to save key: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleClearKey() {
+    if (!pending) return;
+    try {
+      await setLlmApiKey(pending, null);
+      await setLlmModel(pending, null);
+      showToast(`API Key and model cleared for ${labelOf(pending)}.`);
+      setApiKeyInput("");
+      setSelectedModel("");
+      setCustomModelInput("");
+      setShowCustomInput(false);
+      setModels([]);
+      setTest(INITIAL_TEST);
+      await refresh();
+    } catch (err) {
+      showToast(`Failed to clear key: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleSaveModel(modelName: string) {
+    if (!pending) return;
+    try {
+      setSelectedModel(modelName);
+      await setLlmModel(pending, modelName);
+      showToast(`Model configured to ${modelName} for ${labelOf(pending)}.`);
+      await refresh();
+    } catch (err) {
+      showToast(`Failed to save model: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async function runTest() {
@@ -192,7 +218,6 @@ export function AiProvidersSection() {
     if (!pending || applying) return;
     setApplying(true);
     try {
-      // Single-provider model: every feature points at the same name.
       await setLlmConfig({
         auto_prompt: pending,
         vision: pending,
@@ -200,13 +225,7 @@ export function AiProvidersSection() {
       });
       showToast(`AI provider switched to ${labelOf(pending)}.`);
       await refresh();
-      // Broadcast so the badge + ForcedSetupGate refresh immediately
-      // instead of waiting up to 30s for their own poll. Plain window
-      // event keeps the contract loose — anyone interested subscribes,
-      // no shared store coupling.
       window.dispatchEvent(new CustomEvent("flowboard:llm-config-changed"));
-      // Tests stay valid after Apply — provider hasn't changed, we
-      // just persisted the selection.
     } catch (err) {
       showToast(
         `Couldn't apply: ${err instanceof Error ? err.message : String(err)}`,
@@ -215,8 +234,6 @@ export function AiProvidersSection() {
       if (aliveRef.current) setApplying(false);
     }
   }
-
-  // ── Render guards ───────────────────────────────────────────────
 
   if (!providers && !config && !loadError) {
     return (
@@ -248,14 +265,13 @@ export function AiProvidersSection() {
     );
   }
 
-  // Past this point, providers + config are non-null.
   const byName: Record<LLMProviderName, LLMProviderInfo | undefined> = {
     claude: providers!.find((p) => p.name === "claude"),
     gemini: providers!.find((p) => p.name === "gemini"),
     openai: providers!.find((p) => p.name === "openai"),
+    nine_router: providers!.find((p) => p.name === "nine_router"),
   };
 
-  const pendingProvider = pending ? byName[pending] : null;
   const ready = !!pendingProvider && pendingProvider.available && pendingProvider.configured;
   const testPassed = test.state === "ok";
   const testRunning = test.state === "testing";
@@ -276,8 +292,6 @@ export function AiProvidersSection() {
 
       {current === null && config !== null && !config.configured
         && (config.auto_prompt || config.vision || config.planner) && (
-        // Mixed-state notice — at least one feature has been pinned but
-        // not all three (or they diverge). Pick one card to consolidate.
         <div className="ai-providers-section__mixed-notice" role="alert">
           ⓘ Your providers don't match across features
           ({config.auto_prompt ?? "—"} / {config.vision ?? "—"} / {config.planner ?? "—"}).
@@ -286,7 +300,7 @@ export function AiProvidersSection() {
       )}
 
       <div className="provider-group">
-        <div className="provider-group__title">OAuth Providers</div>
+        <div className="provider-group__title">API Providers</div>
         <div className="provider-group__cards">
           {SHOWN_PROVIDERS.map((name) => {
             const p = byName[name];
@@ -306,44 +320,116 @@ export function AiProvidersSection() {
 
       {pending && pendingProvider && (
         <div className="selection-panel">
-          {!ready ? (
-            // Setup-needed branch: surface install/auth guidance before
-            // letting the user attempt to test or apply.
-            <div className="selection-panel__setup">
-              <div className="selection-panel__heading">
-                {labelOf(pending)} needs setup
-              </div>
-              <div className="selection-panel__setup-text">
-                {pendingProvider.lastError === "not_authenticated"
-                  ? "The CLI is installed but not signed in. Open Setup help for the login command."
-                  : "Install the CLI from npm and sign in. Open Setup help for the exact commands."}
-              </div>
-              <button
-                type="button"
-                className="selection-panel__setup-btn"
-                onClick={() => setHelpFor(pending)}
-              >
-                Setup help →
-              </button>
+          <div className="selection-panel__heading">
+            Configure {labelOf(pending)} API Setup
+            <button
+              type="button"
+              className="selection-panel__help-link"
+              onClick={() => setHelpFor(pending)}
+              style={{ float: "right", background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: "11px" }}
+            >
+              Setup help →
+            </button>
+          </div>
+
+          <div className="api-key-setup-block">
+            <span className="api-key-setup-label" style={{ fontSize: "11px", color: "var(--muted)", display: "block", marginBottom: "4px" }}>
+              API Key
+            </span>
+            <div className="api-key-input-row">
+              <input
+                type="password"
+                className="api-key-input"
+                placeholder={pendingProvider.configured ? "••••••••••••••••" : `Enter ${labelOf(pending)} API Key`}
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                disabled={pendingProvider.configured}
+              />
+              {!pendingProvider.configured ? (
+                <button
+                  type="button"
+                  className="api-key-save-btn"
+                  onClick={handleSaveKey}
+                  disabled={!apiKeyInput}
+                >
+                  Save Key
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="api-key-clear-btn"
+                  onClick={handleClearKey}
+                >
+                  Clear Key
+                </button>
+              )}
             </div>
-          ) : (
-            // Ready branch: provider is connected. Show ONE connection
-            // test + Apply. One ping is sufficient — Auto-Prompt /
-            // Vision / Planner all hit the same provider in
-            // single-provider mode, so a working ping for one is a
-            // working ping for all three. (3 parallel pings used to
-            // trigger MODEL_CAPACITY_EXHAUSTED on Gemini's CodeAssist
-            // backend — Google throttles concurrent calls per user.)
-            <>
-              <div className="selection-panel__heading">
-                Test the connection, then Apply
+          </div>
+
+          {pendingProvider.configured && (
+            <div className="model-setup-block" style={{ marginTop: "12px", borderTop: "1px solid var(--border)", paddingTop: "12px" }}>
+              <span className="model-setup-label" style={{ fontSize: "11px", color: "var(--muted)", display: "block", marginBottom: "4px" }}>
+                Active Model
+              </span>
+
+              {loadingModels ? (
+                <div style={{ fontSize: "11px", color: "var(--muted)" }}>Loading models...</div>
+              ) : (
+                <div className="model-select-container" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <select
+                    className="api-key-input"
+                    value={showCustomInput ? "custom" : selectedModel}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === "custom") {
+                        setShowCustomInput(true);
+                      } else {
+                        setShowCustomInput(false);
+                        void handleSaveModel(val);
+                      }
+                    }}
+                  >
+                    {models.map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                    <option value="custom">Custom model name...</option>
+                  </select>
+
+                  {showCustomInput && (
+                    <div className="api-key-input-row">
+                      <input
+                        type="text"
+                        className="api-key-input"
+                        placeholder="Enter custom model ID"
+                        value={customModelInput}
+                        onChange={(e) => setCustomModelInput(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="api-key-save-btn"
+                        onClick={() => void handleSaveModel(customModelInput)}
+                        disabled={!customModelInput}
+                      >
+                        Set Model
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pendingProvider.configured && (
+            <div className="test-apply-block" style={{ marginTop: "12px", borderTop: "1px solid var(--border)", paddingTop: "12px" }}>
+              <div className="selection-panel__heading" style={{ marginBottom: "8px" }}>
+                Test connection, then Apply
               </div>
               <ConnectionTestRow
                 providerLabel={labelOf(pending)}
                 result={test}
                 onTest={runTest}
               />
-              <div className="selection-panel__actions">
+              <div className="selection-panel__actions" style={{ marginTop: "12px" }}>
                 <button
                   type="button"
                   className="selection-panel__apply-btn"
@@ -364,9 +450,7 @@ export function AiProvidersSection() {
                       : "Apply changes"}
                 </button>
               </div>
-
-              <CliReference provider={pending} />
-            </>
+            </div>
           )}
         </div>
       )}
@@ -392,9 +476,6 @@ interface ConnectionTestRowProps {
   onTest(): void;
 }
 
-/** Single connection test for the selected provider. Replaces the old
- * 3-feature test list — one ping is sufficient because all 3 features
- * point at the same provider in single-provider mode. */
 function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowProps) {
   const icon =
     result.state === "ok"
@@ -410,8 +491,8 @@ function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowP
       : result.state === "fail" && result.error
         ? result.error
         : result.state === "testing"
-          ? "Pinging the CLI…"
-          : "Sends one tiny prompt to verify the CLI answers.";
+          ? "Pinging API..."
+          : "Sends one tiny prompt to verify the API key.";
   return (
     <div className={`feature-test-row feature-test-row--${result.state}`}>
       <span
@@ -454,56 +535,6 @@ function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowP
   );
 }
 
-/**
- * Footer shown below the test checklist with the install command + a
- * link to the CLI's official docs. Lets the user copy the upgrade
- * command without leaving the dialog and points them at the canonical
- * source if they need deeper setup help.
- */
-interface CliReferenceProps {
-  provider: LLMProviderName;
-}
-
-function CliReference({ provider }: CliReferenceProps) {
-  const ref = CLI_REFERENCE[provider];
-  const [copied, setCopied] = useState(false);
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(ref.installCmd);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Silent — the command is selectable / readable as text fallback.
-    }
-  }
-
-  return (
-    <div className="cli-reference">
-      <div className="cli-reference__row">
-        <span className="cli-reference__label">Install / upgrade</span>
-        <code className="cli-reference__cmd">{ref.installCmd}</code>
-        <button
-          type="button"
-          className="cli-reference__copy-btn"
-          onClick={handleCopy}
-          aria-label="Copy install command"
-        >
-          {copied ? "✓ Copied" : "Copy"}
-        </button>
-      </div>
-      <a
-        className="cli-reference__docs-link"
-        href={ref.docsUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        Open {ref.docsLabel} ↗
-      </a>
-    </div>
-  );
-}
-
 function labelOf(name: LLMProviderName): string {
   switch (name) {
     case "claude":
@@ -512,5 +543,7 @@ function labelOf(name: LLMProviderName): string {
       return "Gemini";
     case "openai":
       return "OpenAI";
+    case "nine_router":
+      return "9Router Proxy";
   }
 }

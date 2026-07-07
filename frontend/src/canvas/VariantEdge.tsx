@@ -4,6 +4,7 @@ import {
   getBezierPath,
   type EdgeProps,
 } from "@xyflow/react";
+import { useBoardStore } from "../store/board";
 
 /**
  * Edge variant: draws the standard bezier line plus a small chip at the
@@ -30,7 +31,9 @@ export function VariantEdge({
   style,
   markerEnd,
   data,
+  selected,
 }: EdgeProps) {
+  const deleteEdgeByRfId = useBoardStore((s) => s.deleteEdgeByRfId);
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
@@ -41,22 +44,35 @@ export function VariantEdge({
   });
 
   const pin = (data?.sourceVariantIdx ?? null) as number | null;
+  const hasPin = pin !== null && pin >= 0;
 
   return (
     <>
       <BaseEdge id={id} path={edgePath} style={style} markerEnd={markerEnd} />
-      {pin !== null && pin >= 0 && (
+      {(hasPin || selected) && (
         <EdgeLabelRenderer>
           <div
-            // The chip sits centered on the bezier midpoint and ignores
-            // pointer events so it doesn't shadow the edge's invisible
-            // hit area (selection / delete still work as before).
-            className="variant-edge-pin"
+            className="variant-edge-label"
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             }}
           >
-            v{pin + 1}
+            {hasPin && <span className="variant-edge-pin">v{pin + 1}</span>}
+            {selected && (
+              <button
+                type="button"
+                className="variant-edge-delete"
+                title="Delete connection"
+                aria-label="Delete connection"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void deleteEdgeByRfId(id);
+                }}
+              >
+                ×
+              </button>
+            )}
           </div>
         </EdgeLabelRenderer>
       )}

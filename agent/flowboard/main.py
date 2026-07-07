@@ -9,7 +9,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from flowboard.config import WS_HOST
 from flowboard.db import get_session, init_db
 from flowboard.db.models import Request
-from flowboard.routes import activity, auth, boards, chat, edges, flow_projects, llm, media, nodes, plans, projects, prompt, upload, vision
+from flowboard.routes import (
+    activity,
+    auth,
+    boards,
+    chat,
+    edges,
+    flow_projects,
+    llm,
+    media,
+    nodes,
+    plans,
+    projects,
+    prompt,
+    upload,
+    video_composer,
+    vision,
+)
 from flowboard.routes import references as references_route
 from flowboard.routes import requests as requests_route
 from flowboard.services.flow_client import flow_client
@@ -30,8 +46,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 
 def _recover_orphan_running_requests() -> int:
-    """Mark any pre-existing 'running' requests as failed so a restart doesn't
-    leave nodes polling a request that nobody is processing anymore."""
+    """Recover requests left in 'running' after a process restart.
+
+    Omni Flash video renders can outlive a dev-server reload. Re-queue those
+    rows instead of marking them failed so the worker can retry/poll again.
+    Other handlers are not restart-safe yet, so keep the old fail-fast behavior.
+    """
     from datetime import datetime, timezone
     from sqlmodel import select as _select
 
@@ -39,9 +59,14 @@ def _recover_orphan_running_requests() -> int:
     with get_session() as s:
         rows = s.exec(_select(Request).where(Request.status == "running")).all()
         for r in rows:
-            r.status = "failed"
-            r.error = "agent_restart_lost"
-            r.finished_at = datetime.now(timezone.utc)
+            if r.type == "gen_video_omni":
+                r.status = "queued"
+                r.error = None
+                r.finished_at = None
+            else:
+                r.status = "failed"
+                r.error = "agent_restart_lost"
+                r.finished_at = datetime.now(timezone.utc)
             s.add(r)
             touched += 1
         if touched:
@@ -52,10 +77,22 @@ def _recover_orphan_running_requests() -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    recovered = _recover_orphan_running_requests()
-    if recovered:
-        logger.info("recovered %d orphan running request(s) → failed", recovered)
+    recovered_count = _recover_orphan_running_requests()
+    if recovered_count:
+        logger.info("recovered %d orphan running request(s)", recovered_count)
+    
     worker = get_worker()
+    
+    # Enqueue all currently queued requests (including the recovered ones)
+    from sqlmodel import select as _select
+    with get_session() as s:
+        queued_requests = s.exec(_select(Request).where(Request.status == "queued")).all()
+        for r in queued_requests:
+            if r.id is not None:
+                worker.enqueue(r.id)
+        if queued_requests:
+            logger.info("enqueued %d queued request(s) on startup", len(queued_requests))
+
     ws_task = asyncio.create_task(run_ws_server(), name="ext-ws-server")
     worker_task = asyncio.create_task(worker.start(), name="request-worker")
     logger.info("flowboard agent started (ws:9223 + worker)")
@@ -100,14 +137,18 @@ app.include_router(prompt.router)
 app.include_router(auth.router)
 app.include_router(llm.router)
 app.include_router(activity.router)
+app.include_router(video_composer.router)
 
 
 @app.get("/api/health")
 def health() -> dict:
+    from flowboard.services.video_composer import ffmpeg_available
+
     return {
         "ok": True,
         "extension_connected": flow_client.connected,
         "ws_stats": flow_client.ws_stats,
+        "ffmpeg_available": ffmpeg_available(),
     }
 
 

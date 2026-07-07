@@ -11,11 +11,14 @@ when the user's paygate tier or model name drifts.
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import re
 import time
 import uuid
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 from flowboard.services.flow_client import FlowClient, flow_client
 
@@ -26,12 +29,15 @@ logger = logging.getLogger(__name__)
 FLOW_API_BASE = "https://aisandbox-pa.googleapis.com"
 TRPC_CREATE_PROJECT = "https://labs.google/fx/api/trpc/project.createProject"
 TRPC_SEARCH_PROJECTS = "https://labs.google/fx/api/trpc/project.searchUserProjects"
+TRPC_MEDIA_REDIRECT = "https://labs.google/fx/api/trpc/media.getMediaUrlRedirect"
+TRPC_PROJECT_INITIAL_DATA = "https://labs.google/fx/api/trpc/flow.projectInitialData"
 VIDEO_I2V_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoStartImage"
 # Omni Flash uses a separate endpoint that takes referenceImages[] (multi-
 # ref, asset-typed) instead of a single startImage. Different request shape
 # from Veo i2v — see gen_video_omni() for the body assembly.
 VIDEO_OMNI_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_URL = f"{FLOW_API_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
+FLOW_WORKFLOWS_URL = f"{FLOW_API_BASE}/v1/flowWorkflows"
 UPLOAD_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/uploadImage"
 
 
@@ -51,7 +57,7 @@ OMNI_FLASH_VALID_ASPECTS: set[str] = {
 }
 # Informational — backend doesn't enforce, frontend surfaces to the user
 # at dispatch time so the credit cost is visible before submit.
-OMNI_FLASH_CREDIT_COST: dict[int, int] = {4: 15, 6: 20, 8: 25, 10: 30}
+OMNI_FLASH_CREDIT_COST: dict[int, int] = {4: 7, 6: 10, 8: 12, 10: 15}
 
 
 def resolve_omni_flash_model(duration_s: int) -> str:
@@ -66,11 +72,31 @@ def resolve_omni_flash_model(duration_s: int) -> str:
     return key
 
 
-def _media_get_url(media_id: str) -> str:
-    """Endpoint that returns inline encoded video bytes for a workflow's
-    primary media. Used to poll Low Priority (workflow-schema) submissions —
-    they have no operation name and don't appear in ``batchCheckAsync``."""
-    return f"{FLOW_API_BASE}/v1/media/{media_id}?clientContext.tool=PINHOLE"
+def _media_redirect_url(media_id: str) -> str:
+    """Authenticated Flow endpoint used by the web UI for final media."""
+    return f"{TRPC_MEDIA_REDIRECT}?{urlencode({'name': media_id})}"
+
+
+def _media_get_url(media_id: str, project_id: Optional[str] = None) -> str:
+    """Flow API endpoint that returns workflow media inline once ready."""
+    query = {"clientContext.tool": "PINHOLE"}
+    if project_id:
+        query["clientContext.projectId"] = project_id
+    return f"{FLOW_API_BASE}/v1/media/{media_id}?{urlencode(query)}"
+
+
+def _project_initial_data_url(project_id: str) -> str:
+    payload = json.dumps(
+        {"json": {"projectId": project_id}},
+        separators=(",", ":"),
+    )
+    query = urlencode(
+        {
+            "input": payload,
+            "_ts": int(time.time() * 1000),
+        }
+    )
+    return f"{TRPC_PROJECT_INITIAL_DATA}?{query}"
 
 # Image model keys, indexed by the user-facing nickname used in
 # flowkit's models.json. Pro is Flow's premium / higher-quality image
@@ -176,6 +202,26 @@ VIDEO_MODEL_KEYS: dict[str, dict[str, dict[str, str]]] = {
 DEFAULT_VIDEO_QUALITY = "fast"
 
 
+def normalize_video_aspect_ratio(aspect_ratio: str) -> str:
+    """Normalize any image/short aspect ratio to a valid video aspect ratio enum.
+    For example, maps IMAGE_ASPECT_RATIO_PORTRAIT or '9:16' to VIDEO_ASPECT_RATIO_PORTRAIT.
+    If the aspect ratio is unrecognized or already a valid video aspect, it is returned as-is.
+    """
+    if not isinstance(aspect_ratio, str):
+        return aspect_ratio
+
+    val = aspect_ratio.upper()
+    if val in {"VIDEO_ASPECT_RATIO_PORTRAIT", "VIDEO_ASPECT_RATIO_LANDSCAPE"}:
+        return aspect_ratio
+
+    if "PORTRAIT" in val or "SQUARE" in val or "9:16" in val or "1:1" in val:
+        return "VIDEO_ASPECT_RATIO_PORTRAIT"
+    elif "LANDSCAPE" in val or "16:9" in val:
+        return "VIDEO_ASPECT_RATIO_LANDSCAPE"
+
+    return aspect_ratio
+
+
 def resolve_video_model(
     paygate_tier: str, aspect_ratio: str, quality: Optional[str] = None
 ) -> Optional[str]:
@@ -184,6 +230,7 @@ def resolve_video_model(
     Falls back through (quality → fast) → (tier → TIER_ONE) → None so
     a stale frontend or unknown tier can't break dispatch silently.
     """
+    aspect_ratio = normalize_video_aspect_ratio(aspect_ratio)
     q = (quality or DEFAULT_VIDEO_QUALITY).lower()
     tier_map = (
         VIDEO_MODEL_KEYS.get(paygate_tier)
@@ -238,15 +285,126 @@ def _extract_inner_api_error(resp: Any) -> Optional[str]:
     if not (has_status_err or has_data_err):
         return None
     if has_data_err:
+        trpc_error = err.get("json") if isinstance(err.get("json"), dict) else None
+        if trpc_error is not None:
+            message = trpc_error.get("message") or "TRPC error"
+            if status == 401:
+                return f"FLOW_AUTH_REQUIRED: {message}"
+            return str(message)
         reasons: list[str] = []
+        violations: list[str] = []
         for detail in err.get("details") or []:
             if isinstance(detail, dict):
                 r = detail.get("reason")
                 if isinstance(r, str) and r:
                     reasons.append(r)
+                if "fieldViolations" in detail:
+                    for v in detail["fieldViolations"]:
+                        if isinstance(v, dict):
+                            f = v.get("field")
+                            d = v.get("description")
+                            if f or d:
+                                violations.append(f"{f or 'field'}: {d or 'invalid value'}")
         msg = err.get("message") or err.get("status") or "API error"
+        if violations:
+            return f"{msg} ({', '.join(violations)})"
         return f"{reasons[0]}: {msg}" if reasons else str(msg)
     return f"API_{status}"
+
+
+def _find_public_error(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value if "PUBLIC_ERROR_" in value else None
+    if isinstance(value, dict):
+        for child in value.values():
+            found = _find_public_error(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_public_error(child)
+            if found:
+                return found
+    return None
+
+
+def _is_ambiguous_workflow_probe_error(error: Any) -> bool:
+    """Return True for Flow workflow probe errors that mean "not ready yet".
+
+    Workflow-mode video submissions are not valid old-style operation handles,
+    but probing ``batchCheckAsync`` can still return a FAILED envelope with
+    generic messages while Flow is rendering or before the primary media is
+    visible in projectContents. Treating those messages as terminal caused the
+    worker to re-dispatch the same video several times and burn credits.
+    """
+    if not isinstance(error, str):
+        return False
+    normalized = error.strip().rstrip(".").lower()
+    return normalized in {
+        "video not found",
+        "media not found",
+        "request contains an invalid argument",
+        "invalid argument",
+    }
+
+
+def _is_terminal_workflow_probe_error(error: Any) -> bool:
+    """Return True only for workflow probe errors worth failing fast on."""
+    if not isinstance(error, str) or not error.strip():
+        return False
+    if _is_ambiguous_workflow_probe_error(error):
+        return False
+    upper = error.upper()
+    lower = error.lower()
+    return (
+        "PUBLIC_ERROR_" in upper
+        or "content policy" in lower
+        or "unsafe" in lower
+        or "filtered" in lower
+        or "prominent people" in lower
+    )
+
+
+def extract_project_media_states(resp: Any) -> dict[str, dict[str, Optional[str]]]:
+    """Map media ids to persisted Flow generation status and error reason."""
+    if not isinstance(resp, dict):
+        return {}
+    data = resp.get("data")
+    result = data.get("result") if isinstance(data, dict) else None
+    result_data = result.get("data") if isinstance(result, dict) else None
+    payload = result_data.get("json") if isinstance(result_data, dict) else None
+    contents = (
+        payload.get("projectContents")
+        if isinstance(payload, dict)
+        else None
+    )
+    media = contents.get("media") if isinstance(contents, dict) else None
+    if not isinstance(media, list):
+        return {}
+
+    states: dict[str, dict[str, Optional[str]]] = {}
+    for item in media:
+        if not isinstance(item, dict):
+            continue
+        media_id = item.get("name")
+        if not isinstance(media_id, str) or not media_id:
+            continue
+        metadata = item.get("mediaMetadata")
+        media_status = (
+            metadata.get("mediaStatus")
+            if isinstance(metadata, dict)
+            else None
+        )
+        status = (
+            media_status.get("mediaGenerationStatus")
+            if isinstance(media_status, dict)
+            else None
+        )
+        states[media_id] = {
+            "status": status if isinstance(status, str) else None,
+            "error": _find_public_error(item),
+        }
+    return states
 
 
 def is_valid_project_id(project_id: str) -> bool:
@@ -419,6 +577,9 @@ class FlowSDK:
         )
         if isinstance(resp, dict) and resp.get("error"):
             return {"raw": resp, "error": resp["error"]}
+        inner_err = _extract_inner_api_error(resp)
+        if inner_err:
+            return {"raw": resp, "error": inner_err}
 
         project_id = _extract_project_id(resp)
         out: dict[str, Any] = {"raw": resp}
@@ -524,7 +685,7 @@ class FlowSDK:
         out: dict[str, Any] = {"raw": resp, "operation_names": op_names}
         # NEW low-priority workflow models return `data.workflows[]` with a
         # `primaryMediaId` per workflow instead of operations. Surface the
-        # pairing so the poller can hit `/v1/media/<id>` directly.
+        # pairing so the poller can resolve the final signed media URL.
         workflows = extract_video_workflows(resp)
         if workflows:
             out["workflows"] = workflows
@@ -557,6 +718,7 @@ class FlowSDK:
         """
         if paygate_tier is None:
             raise ValueError("paygate_tier is required")
+        aspect_ratio = normalize_video_aspect_ratio(aspect_ratio)
         if aspect_ratio not in OMNI_FLASH_VALID_ASPECTS:
             return {
                 "raw": None,
@@ -573,12 +735,16 @@ class FlowSDK:
         ts = int(time.time() * 1000)
         used_seed = seed if seed is not None else ts % 1_000_000
         ctx = _client_context(project_id, paygate_tier)
+        workflow_id = str(uuid.uuid4())
         request_item = {
             "aspectRatio": aspect_ratio,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,
             "seed": used_seed,
-            "metadata": {},
+            # Flow creates the optimistic workflow client-side and includes
+            # its id in the generation request. Without it the API can return
+            # SCHEDULED media that never appears in projectInitialData.
+            "metadata": {"workflowId": workflow_id},
             "referenceImages": [
                 {"mediaId": mid, "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"}
                 for mid in cleaned_refs
@@ -611,13 +777,72 @@ class FlowSDK:
             return {"raw": resp, "error": inner_err}
 
         op_names = extract_operation_names(resp)
+        workflows = extract_video_workflows(resp)
+        if not op_names and workflows:
+            op_names = [
+                wf["name"]
+                for wf in workflows
+                if isinstance(wf, dict) and isinstance(wf.get("name"), str) and wf.get("name")
+            ]
         if not op_names:
             return {"raw": resp, "error": "no_operations_in_response"}
         out: dict[str, Any] = {"raw": resp, "operation_names": op_names}
-        workflows = extract_video_workflows(resp)
         if workflows:
             out["workflows"] = workflows
+            update_errors = await self._persist_video_workflows(workflows)
+            if update_errors:
+                out["workflow_update_errors"] = update_errors
         return out
+
+    async def _persist_video_workflows(
+        self,
+        workflows: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Attach generated media to workflows, matching Flow's web client."""
+        errors: list[dict[str, str]] = []
+        for workflow in workflows:
+            workflow_id = workflow.get("name")
+            media_id = workflow.get("primary_media_id")
+            project_id = workflow.get("project_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (workflow_id, media_id, project_id)
+            ):
+                continue
+            body = {
+                "workflow": {
+                    "name": workflow_id,
+                    "projectId": project_id,
+                    "metadata": {"primaryMediaId": media_id},
+                },
+                "updateMask": "metadata.primaryMediaId",
+            }
+            resp = await self._client.api_request(
+                url=f"{FLOW_WORKFLOWS_URL}/{workflow_id}",
+                method="PATCH",
+                headers=dict(_API_HEADERS),
+                body=body,
+            )
+            error = (
+                resp.get("error")
+                if isinstance(resp, dict)
+                else "invalid_workflow_update_response"
+            )
+            if not error:
+                error = _extract_inner_api_error(resp)
+            if error:
+                logger.warning(
+                    "workflow persistence failed for %s: %s",
+                    workflow_id,
+                    error,
+                )
+                errors.append(
+                    {
+                        "workflow_id": workflow_id,
+                        "error": str(error)[:200],
+                    }
+                )
+        return errors
 
     async def check_async(
         self,
@@ -631,10 +856,9 @@ class FlowSDK:
         ``{media_id, url, mediaType}`` ready for ``media.ingest_urls``.
 
         ``workflows`` (optional) carries ``{name, primary_media_id}`` pairs
-        from the NEW low-priority response. When provided, every workflow
-        entry is polled against ``/v1/media/<primary_media_id>`` and the
-        result is merged into the same ``operations`` shape so the caller
-        is schema-agnostic.
+        from workflow-mode responses. Each completed media item is resolved
+        through the same authenticated redirect endpoint used by Flow's UI,
+        then merged into the normal ``operations`` shape.
         """
         ops_summary: list[dict[str, Any]] = []
         raw_old: Any = None
@@ -682,20 +906,46 @@ class FlowSDK:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Single poll pass for workflow-mode (Low Priority) submissions.
 
-        For each ``{name, primary_media_id}`` pair, GET ``/v1/media/<id>``
-        and inspect ``video.encodedVideo``. Flow returns base64-encoded MP4
-        once rendering completes; before that the payload is metadata-only
-        (small bytes, no ``ftyp`` magic) — we treat that as "still pending".
+        For each ``{name, primary_media_id}`` pair, call Flow's authenticated
+        ``media.getMediaUrlRedirect`` endpoint. The extension follows the
+        redirect and returns the final signed CDN URL once rendering finishes.
 
         Returns ``(ops_summary, raw_polls)`` mirroring the OLD-schema
         ``check_async`` contract: one entry per workflow with
         ``{name, done, media_entries, status, error}``. The poll loop in
         the worker calls this repeatedly via ``check_async`` until ``done``.
         """
-        import base64 as _b64
-
         ops_summary: list[dict[str, Any]] = []
         raw_polls: list[dict[str, Any]] = []
+        media_states: dict[str, dict[str, Optional[str]]] = {}
+
+        project_ids = {
+            wf.get("project_id")
+            for wf in workflows
+            if isinstance(wf, dict)
+            and isinstance(wf.get("project_id"), str)
+            and wf.get("project_id")
+        }
+        for project_id in project_ids:
+            try:
+                project_resp = await self._client.trpc_request(
+                    url=_project_initial_data_url(project_id),
+                    method="GET",
+                    headers={},
+                    body=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "project media status poll failed for %s: %s",
+                    project_id,
+                    exc,
+                )
+                continue
+            raw_polls.append(
+                {"project_id": project_id, "project_resp": project_resp}
+            )
+            media_states.update(extract_project_media_states(project_resp))
+
         for wf in workflows:
             if not isinstance(wf, dict):
                 continue
@@ -704,10 +954,100 @@ class FlowSDK:
             if not isinstance(name, str) or not isinstance(mid, str) or not mid:
                 continue
             try:
-                resp = await self._client.api_request(
-                    url=_media_get_url(mid),
+                project_id = wf.get("project_id") if isinstance(wf.get("project_id"), str) else None
+                media_resp = await self._client.api_request(
+                    url=_media_get_url(mid, project_id),
                     method="GET",
                     headers=dict(_API_HEADERS),
+                    body=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("workflow media poll error for %s: %s", mid[:8], exc)
+                media_resp = None
+            if isinstance(media_resp, dict):
+                status_code = media_resp.get("status")
+                if (
+                    isinstance(status_code, int)
+                    and status_code >= 400
+                    and status_code != 404
+                ):
+                    inner = _extract_inner_api_error(media_resp)
+                    terminal = isinstance(inner, str) and _is_terminal_workflow_probe_error(inner)
+                    if terminal:
+                        ops_summary.append(
+                            {
+                                "name": name,
+                                "done": True,
+                                "media_entries": [],
+                                "status": "MEDIA_GENERATION_STATUS_FAILED",
+                                "error": inner or f"API_{status_code}",
+                            }
+                        )
+                        continue
+                    else:
+                        # Non-terminal / ambiguous (e.g. invalid argument because rendering is not ready)
+                        # Keep polling by marking done as False.
+                        ops_summary.append(
+                            {
+                                "name": name,
+                                "done": False,
+                                "media_entries": [],
+                                "status": None,
+                                "error": None,
+                            }
+                        )
+                        continue
+
+                data = (
+                    media_resp.get("data")
+                    if isinstance(media_resp.get("data"), dict)
+                    else {}
+                )
+                video_block = (
+                    data.get("video")
+                    if isinstance(data.get("video"), dict)
+                    else {}
+                )
+                encoded = (
+                    video_block.get("encodedVideo")
+                    if isinstance(video_block, dict)
+                    else None
+                )
+                if isinstance(encoded, str) and encoded:
+                    try:
+                        binary = base64.b64decode(encoded, validate=False)
+                    except Exception:  # noqa: BLE001
+                        binary = b""
+                    is_mp4 = len(binary) >= 12 and binary[4:8] == b"ftyp"
+                    if is_mp4:
+                        fife = (
+                            video_block.get("fifeUrl")
+                            if isinstance(video_block, dict)
+                            else None
+                        ) or data.get("fifeUrl")
+                        ops_summary.append(
+                            {
+                                "name": name,
+                                "done": True,
+                                "media_entries": [
+                                    {
+                                        "media_id": mid,
+                                        "url": fife if isinstance(fife, str) else None,
+                                        "mediaType": "video",
+                                        "encoded_video": encoded,
+                                    }
+                                ],
+                                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                                "error": None,
+                            }
+                        )
+                        continue
+
+            try:
+                resp = await self._client.trpc_request(
+                    url=_media_redirect_url(mid),
+                    method="GET",
+                    headers={},
                     body=None,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -732,51 +1072,73 @@ class FlowSDK:
                 )
                 continue
             status_code = resp.get("status")
-            if isinstance(status_code, int) and status_code >= 400 and status_code != 404:
-                # Surface the inner Flow error (e.g. content filter).
+            if isinstance(status_code, int) and status_code >= 400:
                 inner = _extract_inner_api_error(resp)
+                terminal = isinstance(inner, str) and "PUBLIC_ERROR_" in inner
+                if terminal:
+                    ops_summary.append(
+                        {
+                            "name": name,
+                            "done": True,
+                            "media_entries": [],
+                            "status": "MEDIA_GENERATION_STATUS_FAILED",
+                            "error": inner,
+                        }
+                    )
+                else:
+                    state = media_states.get(mid)
+                    persisted_status = state.get("status") if state else None
+                    persisted_error = state.get("error") if state else None
+                    persisted_failed = (
+                        isinstance(persisted_status, str)
+                        and persisted_status.endswith("_FAILED")
+                    )
+                    ops_summary.append(
+                        {
+                            "name": name,
+                            "done": persisted_failed,
+                            "media_entries": [],
+                            "status": persisted_status,
+                            "error": (
+                                persisted_error
+                                or "MEDIA_GENERATION_STATUS_FAILED"
+                                if persisted_failed
+                                else None
+                            ),
+                            "missing_in_project": state is None,
+                        }
+                    )
+                continue
+
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            redirect_url = data.get("redirectUrl")
+            if not (
+                isinstance(redirect_url, str)
+                and redirect_url.startswith("https://")
+            ):
+                state = media_states.get(mid)
+                persisted_status = state.get("status") if state else None
+                persisted_error = state.get("error") if state else None
+                persisted_failed = (
+                    isinstance(persisted_status, str)
+                    and persisted_status.endswith("_FAILED")
+                )
                 ops_summary.append(
                     {
                         "name": name,
-                        "done": True,
+                        "done": persisted_failed,
                         "media_entries": [],
-                        "status": None,
-                        "error": inner or f"API_{status_code}",
+                        "status": persisted_status,
+                        "error": (
+                            persisted_error
+                            or "MEDIA_GENERATION_STATUS_FAILED"
+                            if persisted_failed
+                            else None
+                        ),
+                        "missing_in_project": state is None,
                     }
                 )
                 continue
-
-            # `data` is the body; for /v1/media it's the media object directly.
-            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-            video_block = data.get("video") if isinstance(data.get("video"), dict) else {}
-            encoded = (
-                video_block.get("encodedVideo")
-                if isinstance(video_block, dict)
-                else None
-            )
-            if not isinstance(encoded, str) or not encoded:
-                ops_summary.append(
-                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
-                )
-                continue
-            try:
-                binary = _b64.b64decode(encoded, validate=False)
-            except Exception:  # noqa: BLE001
-                ops_summary.append(
-                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
-                )
-                continue
-            # MP4 box layout: bytes 4..8 == "ftyp" on a complete file.
-            # Until that lands, Flow returns a small metadata payload — skip.
-            is_mp4 = len(binary) >= 12 and binary[4:8] == b"ftyp"
-            if not is_mp4:
-                ops_summary.append(
-                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
-                )
-                continue
-            fife = (
-                video_block.get("fifeUrl") if isinstance(video_block, dict) else None
-            ) or data.get("fifeUrl")
             ops_summary.append(
                 {
                     "name": name,
@@ -784,15 +1146,15 @@ class FlowSDK:
                     "media_entries": [
                         {
                             "media_id": mid,
-                            "url": fife if isinstance(fife, str) else None,
+                            "url": redirect_url,
                             "mediaType": "video",
-                            "encoded_video": encoded,
                         }
                     ],
                     "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
                     "error": None,
                 }
             )
+
         return ops_summary, raw_polls
 
     # ── image generation (api_request + captcha) ───────────────────────────
@@ -974,14 +1336,26 @@ class FlowSDK:
             "isUserUploaded": True,
             "mimeType": mime_type,
         }
-        resp = await self._client.api_request(
-            url=UPLOAD_IMAGE_URL,
-            method="POST",
-            headers=dict(_API_HEADERS),
-            body=body,
-        )
+        resp: dict[str, Any] = {}
+        for attempt in range(2):
+            resp = await self._client.api_request(
+                url=UPLOAD_IMAGE_URL,
+                method="POST",
+                headers=dict(_API_HEADERS),
+                body=body,
+            )
+            if (
+                isinstance(resp, dict)
+                and resp.get("error") == "AUTH_REFRESHED_RETRY"
+                and attempt == 0
+            ):
+                continue
+            break
         if isinstance(resp, dict) and resp.get("error"):
             return {"raw": resp, "error": resp["error"]}
+        inner_err = _extract_inner_api_error(resp)
+        if inner_err:
+            return {"raw": resp, "error": inner_err}
 
         media_id = _extract_uploaded_media_id(resp)
         if media_id is None:
@@ -1074,10 +1448,8 @@ def extract_video_workflows(resp: Any) -> list[dict[str, Any]]:
 
     Returns ``[{"name": <workflow_name>, "primary_media_id": <uuid>}, ...]``.
     Empty list when the response is OLD-schema (operations-based) or has no
-    workflows. Callers use this to drive media-endpoint polling — workflow
-    submits don't yield operations, so ``batchCheckAsync`` can't see them;
-    we poll ``/v1/media/<primaryMediaId>`` directly and read the inline MP4
-    bytes off ``video.encodedVideo`` once it lands.
+    workflows. Callers use this to drive media-redirect polling — workflow
+    submits don't yield operations, so ``batchCheckAsync`` can't see them.
     """
     if not isinstance(resp, dict):
         return []
@@ -1087,6 +1459,21 @@ def extract_video_workflows(resp: Any) -> list[dict[str, Any]]:
     workflows = data.get("workflows")
     if not isinstance(workflows, list):
         return []
+    primary_by_workflow: dict[str, str] = {}
+    media = data.get("media")
+    if isinstance(media, list):
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            workflow_id = item.get("workflowId")
+            media_id = item.get("name")
+            if (
+                isinstance(workflow_id, str)
+                and workflow_id
+                and isinstance(media_id, str)
+                and media_id
+            ):
+                primary_by_workflow.setdefault(workflow_id, media_id)
     out: list[dict[str, Any]] = []
     for wf in workflows:
         if not isinstance(wf, dict):
@@ -1094,8 +1481,15 @@ def extract_video_workflows(resp: Any) -> list[dict[str, Any]]:
         name = wf.get("name")
         meta = wf.get("metadata") if isinstance(wf.get("metadata"), dict) else {}
         primary = meta.get("primaryMediaId") if isinstance(meta, dict) else None
+        if not isinstance(primary, str) or not primary:
+            primary = primary_by_workflow.get(name)
+        project_id = wf.get("projectId")
         if isinstance(name, str) and name and isinstance(primary, str) and primary:
-            out.append({"name": name, "primary_media_id": primary})
+            out.append({
+                "name": name,
+                "primary_media_id": primary,
+                "project_id": project_id,
+            })
     return out
 
 

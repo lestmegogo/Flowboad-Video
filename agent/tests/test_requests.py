@@ -1,5 +1,6 @@
 """Tests for POST /api/requests and GET /api/requests/:id, plus the worker."""
 import asyncio
+import base64
 
 import pytest
 
@@ -8,6 +9,11 @@ from flowboard.worker.processor import WorkerController
 
 def _board(client, name="T"):
     return client.post("/api/boards", json={"name": name}).json()
+
+
+def _mp4_bytes(size: int = 64) -> bytes:
+    header = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
+    return header + b"\x00" * (size - len(header))
 
 
 def test_create_request_persists_and_returns_row(client):
@@ -129,6 +135,10 @@ async def _fail_handler(_params):
     return ({}, "boom")
 
 
+async def _blank_fail_handler(_params):
+    return ({}, "")
+
+
 @pytest.mark.asyncio
 async def test_worker_marks_request_done_on_ok(client):
     # Enqueue via the real API so we get a real DB row.
@@ -176,6 +186,28 @@ async def test_worker_marks_request_failed_on_error(client):
                 break
         assert current["status"] == "failed"
         assert current["error"] == "boom"
+    finally:
+        w.request_shutdown()
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_worker_treats_blank_error_as_failure(client):
+    row = client.post(
+        "/api/requests", json={"type": "proxy", "params": {}}
+    ).json()
+
+    w = WorkerController(handlers={"proxy": _blank_fail_handler})
+    task = asyncio.create_task(w.start())
+    try:
+        w.enqueue(row["id"])
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            current = client.get(f"/api/requests/{row['id']}").json()
+            if current["status"] not in {"queued", "running"}:
+                break
+        assert current["status"] == "failed"
+        assert current["error"] == "request_failed_without_error_details"
     finally:
         w.request_shutdown()
         await asyncio.wait_for(task, timeout=2.0)
@@ -922,6 +954,611 @@ async def test_worker_gen_video_omni_happy_path(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_worker_gen_video_omni_ingests_inline_encoded_video(monkeypatch):
+    from flowboard.services import media as media_service
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        async def gen_video_omni(self, **kwargs):
+            return {
+                "raw": {"ok": True},
+                "operation_names": ["wf-inline"],
+                "workflows": [
+                    {
+                        "name": "wf-inline",
+                        "primary_media_id": "11111111-2222-3333-4444-555555555555",
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": "wf-inline",
+                        "done": True,
+                        "media_entries": [
+                            {
+                                "media_id": "11111111-2222-3333-4444-555555555555",
+                                "mediaType": "video",
+                                "encoded_video": base64.b64encode(
+                                    _mp4_bytes()
+                                ).decode(),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: _StubSdk())
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 6,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert error is None
+    assert result["media_ids"] == ["11111111-2222-3333-4444-555555555555"]
+    cached = media_service.cached_path(
+        "11111111-2222-3333-4444-555555555555"
+    )
+    assert cached is not None
+    assert cached.read_bytes()[4:8] == b"ftyp"
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_retries_transient_poll_error(
+    monkeypatch,
+):
+    """A generic INVALID_ARGUMENT while media is pending is not terminal."""
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.poll_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            return {
+                "raw": {"ok": True},
+                "operation_names": ["wf-omni-1"],
+                "workflows": [
+                    {
+                        "name": "wf-omni-1",
+                        "primary_media_id": "omni-vid-late",
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return {
+                    "raw": {
+                        "status": 400,
+                        "error": "Request contains an invalid argument.",
+                    },
+                    "operations": [
+                        {
+                            "name": "wf-omni-1",
+                            "done": False,
+                            "media_entries": [],
+                            "error": None,
+                        }
+                    ],
+                }
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": "wf-omni-1",
+                        "done": True,
+                        "media_entries": [
+                            {
+                                "media_id": "omni-vid-late",
+                                "url": (
+                                    "https://flow-content.google/"
+                                    "video/omni-vid-late?sig=z"
+                                ),
+                                "mediaType": "video",
+                            }
+                        ],
+                        "error": None,
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert error is None
+    assert result["media_ids"] == ["omni-vid-late"]
+    assert sdk.poll_count == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_retries_dispatch_before_counting_generation(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.dispatch_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.dispatch_count += 1
+            if self.dispatch_count == 1:
+                return {
+                    "raw": {"status": 503},
+                    "error": "AUTH_REFRESHED_RETRY",
+                }
+            return {
+                "raw": {"status": 200},
+                "operation_names": ["wf-after-auth-refresh"],
+            }
+
+        async def check_async(self, names, workflows=None):
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": names[0],
+                        "done": True,
+                        "media_entries": [
+                            {
+                                "media_id": "omni-vid-after-auth-refresh",
+                                "url": (
+                                    "https://flow-content.google/video/"
+                                    "omni-vid-after-auth-refresh?sig=z"
+                                ),
+                                "mediaType": "video",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert error is None
+    assert result["media_ids"] == ["omni-vid-after-auth-refresh"]
+    assert result["generation_attempt"] == 1
+    assert result["attempts"][0]["attempt"] == 1
+    assert result["dispatch_attempts"] == [
+        {
+            "generation_attempt": 1,
+            "dispatch_attempt": 1,
+            "error": "AUTH_REFRESHED_RETRY",
+        }
+    ]
+    assert sdk.dispatch_count == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_reports_when_dispatch_never_reaches_flow(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.dispatch_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.dispatch_count += 1
+            return {
+                "raw": {"status": 503},
+                "error": "FLOW_AUTH_REQUIRED: TOKEN_REFRESH_TIMEOUT",
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert "Could not submit video to Google Flow after 3 attempts" in error
+    assert "FLOW_AUTH_REQUIRED" in error
+    assert result["generation_attempt"] == 0
+    assert result["attempts"] == []
+    assert len(result["dispatch_attempts"]) == 3
+    assert sdk.dispatch_count == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_confirms_failed_workflow(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(proc, "OMNI_FAILURE_CONFIRM_CYCLES", 2)
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.generation_count = 0
+            self.poll_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.generation_count += 1
+            return {
+                "raw": {"ok": True},
+                "operation_names": [
+                    f"wf-rejected-{self.generation_count}"
+                ],
+                "workflows": [
+                    {
+                        "name": f"wf-rejected-{self.generation_count}",
+                        "primary_media_id": (
+                            f"mid-rejected-{self.generation_count}"
+                        ),
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            self.poll_count += 1
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": names[0],
+                        "done": False,
+                        "media_entries": [],
+                        "status": "MEDIA_GENERATION_STATUS_FAILED",
+                        "error": None,
+                        "failure_candidate": (
+                            "PUBLIC_ERROR_UNSAFE_GENERATION: "
+                            "Request blocked by content policy."
+                        ),
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "famous person walking",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert "after 1 attempt" in error
+    assert "PUBLIC_ERROR_UNSAFE_GENERATION" in error
+    assert "PUBLIC_ERROR_UNSAFE_GENERATION" in result["op_errors"]["wf-rejected-1"]
+    assert len(result["attempts"]) == 1
+    assert sdk.generation_count == 1
+    assert sdk.poll_count == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_not_found_probe_times_out_without_redispatch(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(proc, "VIDEO_POLL_MAX_CYCLES", 3)
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.generation_count = 0
+            self.poll_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.generation_count += 1
+            return {
+                "raw": {"ok": True},
+                "operation_names": ["wf-still-rendering"],
+                "workflows": [
+                    {
+                        "name": "wf-still-rendering",
+                        "primary_media_id": "mid-still-rendering",
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            self.poll_count += 1
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": names[0],
+                        "done": False,
+                        "media_entries": [],
+                        "status": "MEDIA_GENERATION_STATUS_FAILED",
+                        "error": None,
+                        "workflow_probe_error": "Video not found.",
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert error == "timeout_waiting_video"
+    assert result["generation_attempt"] == 1
+    assert result["op_errors"] == {
+        "wf-still-rendering": "timeout_waiting_video"
+    }
+    assert len(result["attempts"]) == 1
+    assert sdk.generation_count == 1
+    assert sdk.poll_count == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_missing_workflow_times_out_without_redispatch(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(proc, "VIDEO_POLL_MAX_CYCLES", 3)
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.generation_count = 0
+            self.poll_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.generation_count += 1
+            suffix = str(self.generation_count)
+            return {
+                "raw": {"ok": True},
+                "operation_names": [f"wf-{suffix}"],
+                "workflows": [
+                    {
+                        "name": f"wf-{suffix}",
+                        "primary_media_id": f"mid-{suffix}",
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            self.poll_count += 1
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": names[0],
+                        "done": False,
+                        "media_entries": [],
+                        "status": "MEDIA_GENERATION_STATUS_FAILED",
+                        "error": None,
+                        "missing_in_project": True,
+                        "workflow_probe_error": "Video not found.",
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert error == "timeout_waiting_video"
+    assert result["generation_attempt"] == 1
+    assert result["op_errors"] == {"wf-1": "timeout_waiting_video"}
+    assert len(result["attempts"]) == 1
+    assert sdk.generation_count == 1
+    assert sdk.poll_count == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_gen_video_omni_does_not_redispatch_failed_generation(
+    monkeypatch,
+):
+    from flowboard.services import media_project_sync as sync_mod
+    from flowboard.worker import processor as proc
+
+    monkeypatch.setattr(proc, "VIDEO_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(proc, "OMNI_FAILURE_CONFIRM_CYCLES", 1)
+    monkeypatch.setattr(proc, "OMNI_GENERATION_RETRY_DELAY_S", 0)
+
+    async def _stub_sync(ids, project_id):
+        return list(ids), []
+
+    monkeypatch.setattr(sync_mod, "ensure_media_ids_in_project", _stub_sync)
+
+    class _StubSdk:
+        def __init__(self):
+            self.generation_count = 0
+
+        async def gen_video_omni(self, **kwargs):
+            self.generation_count += 1
+            suffix = str(self.generation_count)
+            return {
+                "raw": {"ok": True},
+                "operation_names": [f"wf-{suffix}"],
+                "workflows": [
+                    {
+                        "name": f"wf-{suffix}",
+                        "primary_media_id": f"mid-{suffix}",
+                    }
+                ],
+            }
+
+        async def check_async(self, names, workflows=None):
+            if self.generation_count == 1:
+                return {
+                    "raw": {},
+                    "operations": [
+                        {
+                            "name": names[0],
+                            "done": False,
+                            "media_entries": [],
+                            "status": "MEDIA_GENERATION_STATUS_FAILED",
+                            "error": None,
+                            "failure_candidate": (
+                                "PUBLIC_ERROR_UNSAFE_GENERATION: "
+                                "Request blocked by content policy."
+                            ),
+                        }
+                    ],
+                }
+            return {
+                "raw": {},
+                "operations": [
+                    {
+                        "name": names[0],
+                        "done": True,
+                        "media_entries": [
+                            {
+                                "media_id": "omni-vid-retried",
+                                "url": (
+                                    "https://flow-content.google/"
+                                    "video/omni-vid-retried?sig=z"
+                                ),
+                                "mediaType": "video",
+                            }
+                        ],
+                        "error": None,
+                    }
+                ],
+            }
+
+    sdk = _StubSdk()
+    monkeypatch.setattr(proc, "get_flow_sdk", lambda: sdk)
+
+    result, error = await proc._handle_gen_video_omni(
+        {
+            "prompt": "subtle movement",
+            "project_id": "abcd1234",
+            "ref_media_ids": ["ref-aaa"],
+            "duration_s": 10,
+            "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "paygate_tier": "PAYGATE_TIER_ONE",
+        }
+    )
+
+    assert "after 1 attempt" in error
+    assert "PUBLIC_ERROR_UNSAFE_GENERATION" in error
+    assert result["generation_attempt"] == 1
+    assert "PUBLIC_ERROR_UNSAFE_GENERATION" in result["attempts"][0]["error"]
+    assert len(result["attempts"]) == 1
+    assert sdk.generation_count == 1
+
+
+@pytest.mark.asyncio
 async def test_worker_gen_video_omni_rejects_invalid_duration(client, monkeypatch):
     """Duration must be one of {4,6,8,10}. 5s / 7s / 12s reject hard."""
     from flowboard.worker import processor as proc
@@ -967,7 +1604,7 @@ def test_omni_flash_credit_cost_table():
     the contract so a Pro user doesn't get surprised by a silent rebase."""
     from flowboard.services.flow_sdk import OMNI_FLASH_CREDIT_COST
 
-    assert OMNI_FLASH_CREDIT_COST == {4: 15, 6: 20, 8: 25, 10: 30}
+    assert OMNI_FLASH_CREDIT_COST == {4: 7, 6: 10, 8: 12, 10: 15}
 
 
 def test_omni_flash_resolve_model():

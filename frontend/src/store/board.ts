@@ -94,6 +94,15 @@ export interface FlowboardNodeData extends Record<string, unknown> {
   // missing (true for fresh nodes + legacy pre-1.2.15 nodes whose
   // multi-shot data is now ignored).
   storyboardGrid?: StoryboardGrid;
+  videoOrder?: string[];
+  audioMediaId?: string;
+  audioFilename?: string;
+  audioMode?: "original" | "muted" | "mix" | "music";
+  originalVolume?: number;
+  musicVolume?: number;
+  assemblyProgress?: number;
+  assemblyStage?: string;
+  durationS?: number;
 }
 
 export type FlowNode = Node<FlowboardNodeData>;
@@ -142,6 +151,7 @@ const TYPE_TITLE: Record<NodeType, string> = {
   note: "Note",
   visual_asset: "Visual asset",
   Storyboard: "Storyboard",
+  video_composer: "Video Composer",
 };
 
 // ── Persisted active-board id ─────────────────────────────────────────────
@@ -283,6 +293,18 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          videoOrder: n.data["videoOrder"] as string[] | undefined,
+          audioMediaId: n.data["audioMediaId"] as string | undefined,
+          audioFilename: n.data["audioFilename"] as string | undefined,
+          audioMode: n.data["audioMode"] as
+            | FlowboardNodeData["audioMode"],
+          originalVolume: n.data["originalVolume"] as number | undefined,
+          musicVolume: n.data["musicVolume"] as number | undefined,
+          assemblyProgress: n.data["assemblyProgress"] as number | undefined,
+          assemblyStage: n.data["assemblyStage"] as string | undefined,
+          durationS: n.data["durationS"] as number | undefined,
+          renderedAt: n.data["renderedAt"] as string | undefined,
+          error: n.data["error"] as string | undefined,
         },
       }));
 
@@ -297,6 +319,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         loading: false,
       });
       persistBoardId(detail.board.id);
+      import("./generation").then(({ useGenerationStore }) => {
+        useGenerationStore.setState({ projectId: null });
+      }).catch(() => {});
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -339,6 +364,18 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          videoOrder: n.data["videoOrder"] as string[] | undefined,
+          audioMediaId: n.data["audioMediaId"] as string | undefined,
+          audioFilename: n.data["audioFilename"] as string | undefined,
+          audioMode: n.data["audioMode"] as
+            | FlowboardNodeData["audioMode"],
+          originalVolume: n.data["originalVolume"] as number | undefined,
+          musicVolume: n.data["musicVolume"] as number | undefined,
+          assemblyProgress: n.data["assemblyProgress"] as number | undefined,
+          assemblyStage: n.data["assemblyStage"] as string | undefined,
+          durationS: n.data["durationS"] as number | undefined,
+          renderedAt: n.data["renderedAt"] as string | undefined,
+          error: n.data["error"] as string | undefined,
         },
       }));
       const edges: Edge[] = detail.edges.map(edgeFromDto);
@@ -350,6 +387,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         loading: false,
       });
       persistBoardId(detail.board.id);
+      import("./generation").then(({ useGenerationStore }) => {
+        useGenerationStore.setState({ projectId: null });
+      }).catch(() => {});
     } catch (err) {
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -422,6 +462,17 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          videoOrder: n.data["videoOrder"] as string[] | undefined,
+          audioMediaId: n.data["audioMediaId"] as string | undefined,
+          audioFilename: n.data["audioFilename"] as string | undefined,
+          audioMode: n.data["audioMode"] as
+            | FlowboardNodeData["audioMode"],
+          originalVolume: n.data["originalVolume"] as number | undefined,
+          musicVolume: n.data["musicVolume"] as number | undefined,
+          assemblyProgress: n.data["assemblyProgress"] as number | undefined,
+          assemblyStage: n.data["assemblyStage"] as string | undefined,
+          durationS: n.data["durationS"] as number | undefined,
+          renderedAt: n.data["renderedAt"] as string | undefined,
           error: n.data["error"] as string | undefined,
         },
       }));
@@ -557,6 +608,12 @@ export const useBoardStore = create<BoardState>((set, get) => ({
       useGenerationStore.getState().cancelGeneration(rfId);
     } catch {
       // If the module isn't loaded yet (tree-shaken test path), ignore.
+    }
+    try {
+      const { useVideoComposerStore } = await import("./videoComposer");
+      await useVideoComposerStore.getState().cancelComposition(rfId);
+    } catch {
+      // Composer store may not be loaded in narrow test paths.
     }
     try {
       await deleteNode(dbId);

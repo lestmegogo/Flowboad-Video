@@ -12,6 +12,8 @@ rationale.
 """
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 
@@ -22,6 +24,26 @@ class LLMError(RuntimeError):
     HTTP layer can surface a single error shape regardless of which
     provider failed. Never carries the API key or any token.
     """
+
+
+_IMAGE_MIME_BY_SUFFIX = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def image_mime_type(path: Path) -> str:
+    """Return a stable image MIME type independent of the host registry."""
+    known = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
+    if known:
+        return known
+    guessed = mimetypes.guess_type(str(path))[0]
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/jpeg"
 
 
 @runtime_checkable

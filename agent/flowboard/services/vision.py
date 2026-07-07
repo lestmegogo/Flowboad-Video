@@ -94,7 +94,7 @@ async def describe_media(media_id: str, *, node_id: Optional[int] = None) -> str
                 _VISION_USER_PROMPT,
                 system_prompt=_VISION_SYSTEM,
                 attachments=[str(cached.resolve())],
-                timeout=120.0,
+                timeout=300.0,
             )
         except LLMError as exc:
             raise VisionError(f"vision provider failed: {exc}") from exc

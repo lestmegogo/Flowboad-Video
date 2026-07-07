@@ -1,314 +1,187 @@
-"""Tests for the Gemini provider.
-
-The provider invokes ``gemini`` synchronously via ``subprocess.run`` (a
-deliberate Windows-compat choice — asyncio subprocess on Windows requires
-``ProactorEventLoop`` which FastAPI doesn't use). Tests stub
-``subprocess.run`` at the module boundary and assert on the argv it
-receives plus the JSON envelope it returns.
-
-CLI args under test:
-- ``-m <model>``     stable-tier pin (default ``gemini-2.5-flash``)
-- ``-o json``        structured envelope, parsed into ``response`` field
-- ``-p <prompt>``    user prompt (system + attachments folded in body)
-"""
+"""Tests for the Gemini REST API provider."""
 from __future__ import annotations
 
-import subprocess as _subprocess
-from dataclasses import dataclass
+import base64
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
+from flowboard.services.llm import secrets
 from flowboard.services.llm.base import LLMError
 from flowboard.services.llm.gemini import GeminiProvider
 
 
-@dataclass
-class _FakeResult:
-    """Stand-in for ``subprocess.CompletedProcess`` shape used by the provider."""
-    returncode: int = 0
-    stdout: bytes = b""
-    stderr: bytes = b""
+@pytest.fixture
+def tmp_secrets_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    path = tmp_path / "secrets.json"
+    monkeypatch.setenv("FLOWBOARD_SECRETS_PATH", str(path))
+    return path
 
 
-def _envelope(response: str) -> bytes:
-    """Build a realistic ``-o json`` stdout envelope for stubbing."""
-    import json
-    return json.dumps({
-        "session_id": "00000000-0000-0000-0000-000000000000",
-        "response": response,
-        "stats": {"models": {}},
-    }).encode("utf-8")
+class _Response:
+    def __init__(self, status_code: int = 200, payload=None, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
 
 
-def _stub_run(monkeypatch, returns):
-    """Patch subprocess.run on the gemini module. ``returns`` may be a
-    single _FakeResult or a list (consumed in order) or a callable
-    ``(args, kwargs) -> _FakeResult`` for inspection-style tests."""
-    state = {"calls": []}
-    if callable(returns):
-        def _run(*args, **kwargs):
-            state["calls"].append((args, kwargs))
-            return returns(args, kwargs)
-    elif isinstance(returns, list):
-        it = iter(returns)
-        def _run(*args, **kwargs):
-            state["calls"].append((args, kwargs))
-            return next(it)
-    else:
-        def _run(*args, **kwargs):
-            state["calls"].append((args, kwargs))
-            return returns
-    monkeypatch.setattr(
-        "flowboard.services.llm.gemini.subprocess.run", _run,
-    )
-    return state
-
-
-def _stub_resolve(monkeypatch, path: str = "/fake/bin/gemini"):
-    """Pin the resolved binary path so PATH lookup doesn't leak."""
-    monkeypatch.setattr(
-        "flowboard.services.llm.gemini.resolve_cli_binary",
-        lambda *_a, **_kw: path,
+def _success(text: str = "ok") -> _Response:
+    return _Response(
+        payload={"candidates": [{"content": {"parts": [{"text": text}]}}]}
     )
 
 
-# ── is_available ───────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_is_available_tracks_api_key(tmp_secrets_path):
+    provider = GeminiProvider()
+    assert await provider.is_available() is False
+
+    secrets.set_api_key("gemini", "gemini-key")
+    assert await provider.is_available() is True
 
 
 @pytest.mark.asyncio
-async def test_is_available_true_when_version_succeeds(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=b"gemini 0.38.0\n"))
-    assert await p.is_available() is True
+async def test_run_requires_api_key(tmp_secrets_path):
+    with pytest.raises(LLMError, match="API key not configured"):
+        await GeminiProvider().run("hello")
 
 
 @pytest.mark.asyncio
-async def test_is_available_false_when_binary_missing(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    def _raise(*a, **kw):
-        raise FileNotFoundError("gemini")
-    monkeypatch.setattr("flowboard.services.llm.gemini.subprocess.run", _raise)
-    assert await p.is_available() is False
+async def test_run_builds_generate_content_request(tmp_secrets_path):
+    secrets.set_api_key("gemini", "secret-key")
+    secrets.set_model("gemini", "gemini-2.5-pro")
 
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_success("answer")),
+    ) as post:
+        result = await GeminiProvider().run(
+            "user prompt",
+            system_prompt="system prompt",
+            timeout=12.0,
+        )
 
-@pytest.mark.asyncio
-async def test_is_available_false_when_version_nonzero(monkeypatch):
-    """CLI installed but the binary returns non-zero (e.g. incompatible
-    Node version) — treat as unavailable."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=1, stderr=b"node ver mismatch"))
-    assert await p.is_available() is False
-
-
-@pytest.mark.asyncio
-async def test_is_available_caches_after_first_probe(monkeypatch):
-    """Probe should be cheap — don't re-spawn `gemini --version` per dispatch."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=b"gemini 0.38.0\n"))
-    await p.is_available()
-    await p.is_available()
-    await p.is_available()
-    assert len(state["calls"]) == 1
-
-
-# ── run — prompt composition ──────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_run_returns_envelope_response_field(monkeypatch):
-    """``-o json`` envelope shape: ``{response: "<text>", ...}``. The
-    provider extracts ``response`` and discards everything else."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("hello world")))
-    out = await p.run("hi")
-    assert out == "hello world"
-
-
-@pytest.mark.asyncio
-async def test_run_emits_o_json_flag(monkeypatch):
-    """Argv must include ``-o json`` so the CLI emits structured output
-    instead of raw text mixed with banner / tip / ANSI noise."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    await p.run("hi")
-    argv = list(state["calls"][0][0][0])
-    assert "-o" in argv
-    assert argv[argv.index("-o") + 1] == "json"
-
-
-@pytest.mark.asyncio
-async def test_run_raises_when_envelope_is_not_json(monkeypatch):
-    """If the CLI emits text outside the JSON shape (e.g. login banner
-    consumed all of stdout), surface a clear LLMError instead of
-    silently returning garbage."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=b"Loaded cached credentials\n"))
-    with pytest.raises(LLMError, match="non-JSON output"):
-        await p.run("hi")
-
-
-@pytest.mark.asyncio
-async def test_run_raises_when_envelope_missing_response_field(monkeypatch):
-    """Defensive: if the envelope shape changes upstream and ``response``
-    disappears, fail loud rather than returning the empty string."""
-    import json
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(
-        monkeypatch,
-        _FakeResult(returncode=0, stdout=json.dumps({"session_id": "x"}).encode()),
+    assert result == "answer"
+    call = post.await_args
+    assert (
+        call.args[0]
+        == "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-pro:generateContent?key=secret-key"
     )
-    with pytest.raises(LLMError, match="missing string 'response'"):
-        await p.run("hi")
+    assert call.kwargs["json"] == {
+        "contents": [{"role": "user", "parts": [{"text": "user prompt"}]}],
+        "systemInstruction": {"parts": [{"text": "system prompt"}]},
+    }
 
 
 @pytest.mark.asyncio
-async def test_run_passes_prompt_as_argv_token(monkeypatch):
-    """Prompt with quotes/newlines reaches the CLI verbatim via argv."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    tricky = 'a "quoted" $VAR\nnewline'
-    await p.run(tricky)
-    argv = list(state["calls"][0][0][0])
-    p_idx = argv.index("-p")
-    assert argv[p_idx + 1] == tricky
+async def test_run_uses_env_model_when_no_saved_model(
+    tmp_secrets_path, monkeypatch
+):
+    secrets.set_api_key("gemini", "key")
+    monkeypatch.setenv("FLOWBOARD_GEMINI_MODEL", "gemini-custom")
+
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_success()),
+    ) as post:
+        await GeminiProvider().run("hello")
+
+    assert "/models/gemini-custom:generateContent" in post.await_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_run_prepends_system_prompt_into_body(monkeypatch):
-    """The CLI has no `--system` flag (verified against the real binary's
-    `--help`), so the system prompt is folded into the prompt body as a
-    `[System: ...]` block separated by a blank line."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    await p.run("user question", system_prompt="be terse")
-    argv = list(state["calls"][0][0][0])
-    prompt = argv[argv.index("-p") + 1]
-    assert "[System: be terse]" in prompt
-    assert "user question" in prompt
-    assert prompt.index("[System:") < prompt.index("user question")
-    assert "--system" not in argv
+async def test_saved_model_wins_over_environment(tmp_secrets_path, monkeypatch):
+    secrets.set_api_key("gemini", "key")
+    secrets.set_model("gemini", "saved-model")
+    monkeypatch.setenv("FLOWBOARD_GEMINI_MODEL", "env-model")
+
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_success()),
+    ) as post:
+        await GeminiProvider().run("hello")
+
+    assert "/models/saved-model:generateContent" in post.await_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_run_pins_stable_model_via_m_flag(monkeypatch):
-    """Default pins `gemini-2.5-flash` (stable tier) via `-m` to avoid
-    Gemini CLI's Auto-mode default of `gemini-3-flash-preview`, which
-    Google routinely 429s with MODEL_CAPACITY_EXHAUSTED."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    monkeypatch.delenv("FLOWBOARD_GEMINI_MODEL", raising=False)
-    await p.run("hi")
-    argv = list(state["calls"][0][0][0])
-    m_idx = argv.index("-m")
-    assert argv[m_idx + 1] == "gemini-2.5-flash"
-    assert "-preview" not in argv[m_idx + 1]
+async def test_run_encodes_image_attachments(tmp_secrets_path, tmp_path):
+    secrets.set_api_key("gemini", "key")
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"image-bytes")
+
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_success()),
+    ) as post:
+        await GeminiProvider().run("describe", attachments=[str(image)])
+
+    parts = post.await_args.kwargs["json"]["contents"][0]["parts"]
+    assert parts[0] == {
+        "inlineData": {
+            "mimeType": "image/png",
+            "data": base64.b64encode(b"image-bytes").decode("ascii"),
+        }
+    }
+    assert parts[1] == {"text": "describe"}
 
 
 @pytest.mark.asyncio
-async def test_run_respects_env_var_model_override(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    monkeypatch.setenv("FLOWBOARD_GEMINI_MODEL", "gemini-2.5-pro")
-    await p.run("hi")
-    argv = list(state["calls"][0][0][0])
-    m_idx = argv.index("-m")
-    assert argv[m_idx + 1] == "gemini-2.5-pro"
+async def test_run_rejects_missing_attachment(tmp_secrets_path, tmp_path):
+    secrets.set_api_key("gemini", "key")
+    missing = tmp_path / "missing.jpg"
+
+    with pytest.raises(LLMError, match="Attachment file not found"):
+        await GeminiProvider().run("describe", attachments=[str(missing)])
 
 
 @pytest.mark.asyncio
-async def test_run_no_system_prompt_omits_system_block(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    await p.run("just the user prompt")
-    argv = list(state["calls"][0][0][0])
-    prompt = argv[argv.index("-p") + 1]
-    assert "[System:" not in prompt
-    assert prompt == "just the user prompt"
+async def test_run_surfaces_api_error_without_leaking_response_shape(
+    tmp_secrets_path,
+):
+    secrets.set_api_key("gemini", "key")
+    response = _Response(
+        status_code=429,
+        payload={"error": {"message": "quota exhausted"}},
+    )
 
-
-# ── run — image attachments via @path ─────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_run_inlines_attachments_as_at_paths(monkeypatch, tmp_path):
-    p = GeminiProvider()
-    img1 = tmp_path / "a.jpg"; img1.write_bytes(b"fake")
-    img2 = tmp_path / "b.jpg"; img2.write_bytes(b"fake")
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    await p.run("describe", attachments=[str(img1), str(img2)])
-    argv = list(state["calls"][0][0][0])
-    prompt = argv[argv.index("-p") + 1]
-    assert f"@{img1}" in prompt or f"@{img1.resolve()}" in prompt
-    assert f"@{img2}" in prompt or f"@{img2.resolve()}" in prompt
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=response),
+    ):
+        with pytest.raises(LLMError, match="Gemini HTTP 429: quota exhausted"):
+            await GeminiProvider().run("hello")
 
 
 @pytest.mark.asyncio
-async def test_run_attachments_use_absolute_paths(monkeypatch, tmp_path):
-    """@<path> tokens must be absolute so the CLI's cwd doesn't matter."""
-    p = GeminiProvider()
-    img = tmp_path / "x.jpg"; img.write_bytes(b"fake")
-    _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=_envelope("ok")))
-    await p.run("describe", attachments=[str(img)])
-    argv = list(state["calls"][0][0][0])
-    prompt = argv[argv.index("-p") + 1]
-    assert "@/" in prompt
+async def test_run_wraps_timeout(tmp_secrets_path):
+    secrets.set_api_key("gemini", "key")
 
-
-# ── run — error paths ─────────────────────────────────────────────────
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(side_effect=httpx.TimeoutException("late")),
+    ):
+        with pytest.raises(LLMError, match="timed out after 3.0s"):
+            await GeminiProvider().run("hello", timeout=3.0)
 
 
 @pytest.mark.asyncio
-async def test_run_raises_on_nonzero_exit(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=1, stderr=b"auth required"))
-    with pytest.raises(LLMError, match="exited 1"):
-        await p.run("hi")
+async def test_run_rejects_malformed_success_response(tmp_secrets_path):
+    secrets.set_api_key("gemini", "key")
 
-
-@pytest.mark.asyncio
-async def test_run_raises_on_quota_exhaustion(monkeypatch):
-    """Specific path for 429 / 'exhausted' / 'quota' so callers can
-    surface a quota-aware message rather than a generic exit-code error."""
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    _stub_run(monkeypatch, _FakeResult(returncode=1, stderr=b"429 quota exhausted"))
-    with pytest.raises(LLMError, match="quota exhausted"):
-        await p.run("hi")
-
-
-@pytest.mark.asyncio
-async def test_run_raises_on_missing_binary(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    def _raise(*a, **kw):
-        raise FileNotFoundError("gemini")
-    monkeypatch.setattr("flowboard.services.llm.gemini.subprocess.run", _raise)
-    with pytest.raises(LLMError, match="not found on PATH"):
-        await p.run("hi")
-
-
-@pytest.mark.asyncio
-async def test_run_raises_on_timeout(monkeypatch):
-    p = GeminiProvider()
-    _stub_resolve(monkeypatch)
-    def _raise(*a, **kw):
-        raise _subprocess.TimeoutExpired(cmd="gemini", timeout=0.05)
-    monkeypatch.setattr("flowboard.services.llm.gemini.subprocess.run", _raise)
-    with pytest.raises(LLMError, match="timed out"):
-        await p.run("hi", timeout=0.05)
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_Response(payload={"candidates": []})),
+    ):
+        with pytest.raises(LLMError, match="response structure invalid"):
+            await GeminiProvider().run("hello")

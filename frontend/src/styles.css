@@ -1387,7 +1387,9 @@ button:disabled {
    sourceVariantIdx. pointer-events: none so the underlying edge hit
    area still wins for selection / delete. */
 .variant-edge-pin {
-  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   pointer-events: none;
   font-size: 10px;
   font-weight: 600;
@@ -3023,11 +3025,48 @@ button:disabled {
   background: var(--panel-high);
 }
 
+.node-header__btn--danger:hover {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.16);
+}
+
 /* Running state for the gen button — keep it visible so the user knows a
    request is in flight even when not hovering the card. */
 .node-header__btn--running {
   color: var(--accent);
   opacity: 1;
+}
+
+/* Selected connections expose a compact midpoint delete affordance. This
+   overlay does not change node dimensions or the existing card layout. */
+.variant-edge-label {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.variant-edge-delete {
+  pointer-events: all;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.16);
+  border: 1px solid rgba(239, 68, 68, 0.48);
+  color: #fca5a5;
+  font-size: 14px;
+  line-height: 1;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.variant-edge-delete:hover {
+  background: rgba(239, 68, 68, 0.28);
+  color: #fff;
 }
 
 /* ── Generation Dialog ───────────────────────────────────────────────────── */
@@ -4190,7 +4229,7 @@ button:disabled {
 }
 .provider-group__cards {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
 }
 
@@ -4363,6 +4402,71 @@ button:disabled {
 .selection-panel__test-all-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* API key config row inside selection panel */
+.api-key-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.api-key-input {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.12s;
+}
+.api-key-input:focus {
+  border-color: var(--accent);
+}
+.api-key-input:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+.api-key-save-btn,
+.api-key-clear-btn {
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+.api-key-save-btn {
+  background: rgba(124, 92, 255, 0.22);
+  border: 1px solid var(--accent);
+  color: #d4c4ff;
+}
+.api-key-save-btn:hover:not(:disabled) {
+  background: rgba(124, 92, 255, 0.34);
+}
+.api-key-save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.api-key-clear-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.api-key-clear-btn:hover {
+  border-color: rgba(255, 90, 90, 0.4);
+  color: #ff8888;
+}
+select.api-key-input {
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a0a0a0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+  padding-right: 28px;
 }
 
 /* Feature test row — 3 of these in the test list. */
@@ -4903,6 +5007,352 @@ button:disabled {
 .node-header__btn[disabled] {
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+/* Video Composer */
+.video-composer-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+
+.video-composer__header,
+.video-composer__audio-head,
+.video-composer__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.video-composer__subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.video-composer__close,
+.video-composer__clip button,
+.video-composer__audio button,
+.video-composer__audio-head button {
+  border: 1px solid var(--border);
+  background: var(--panel-high);
+  color: var(--text);
+  border-radius: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.video-composer__close {
+  width: 30px;
+  padding: 0;
+  font-size: 18px;
+}
+
+.video-composer__preview {
+  width: 100%;
+  max-height: 260px;
+  margin-top: 14px;
+  border-radius: 8px;
+  background: #050505;
+}
+
+.video-composer__progress {
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(124, 92, 255, 0.08);
+}
+
+.video-composer__progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.video-composer__progress-head strong {
+  color: #c4b5fd;
+  font: 700 12px ui-monospace, monospace;
+}
+
+.video-composer__progress-track,
+.video-composer-node__progress {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.video-composer__progress-track > span,
+.video-composer-node__progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7c5cff, #a78bfa);
+  transition: width 280ms ease;
+}
+
+.video-composer__progress.is-complete {
+  border-color: rgba(34, 197, 94, 0.35);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.video-composer__progress.is-complete .video-composer__progress-head strong {
+  color: #86efac;
+}
+
+.video-composer__progress.is-complete .video-composer__progress-track > span {
+  background: #22c55e;
+}
+
+.video-composer__progress.is-error {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.video-composer__progress.is-error .video-composer__progress-head strong {
+  color: #fca5a5;
+}
+
+.video-composer__progress.is-error .video-composer__progress-track > span {
+  background: #ef4444;
+}
+
+.video-composer__section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.video-composer__section-title,
+.video-composer__label {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.video-composer__empty {
+  padding: 18px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+.video-composer__clips {
+  display: grid;
+  gap: 7px;
+}
+
+.video-composer__clip {
+  display: grid;
+  grid-template-columns: 18px 24px 72px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+  min-height: 54px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.video-composer__clip.is-dragging {
+  opacity: 0.45;
+}
+
+.video-composer__drag {
+  color: var(--muted);
+  cursor: grab;
+}
+
+.video-composer__index {
+  color: var(--accent);
+  font: 600 11px ui-monospace, monospace;
+}
+
+.video-composer__clip video {
+  width: 72px;
+  height: 42px;
+  border-radius: 5px;
+  object-fit: cover;
+  background: #000;
+}
+
+.video-composer__missing {
+  width: 72px;
+  color: #fca5a5;
+  font-size: 9px;
+}
+
+.video-composer__clip-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.video-composer__clip button {
+  min-height: 26px;
+  width: 26px;
+  padding: 0;
+  color: #fca5a5;
+}
+
+.video-composer__settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.video-composer__settings label,
+.video-composer__section > label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.video-composer__settings select {
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 0 9px;
+}
+
+.video-composer__segments {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.video-composer__segments button {
+  min-height: 34px;
+  border: 0;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.video-composer__segments button.is-active {
+  background: rgba(124, 92, 255, 0.2);
+  color: #d8ceff;
+}
+
+.video-composer__music-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.video-composer__audio {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(220px, 2fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+  font-size: 11px;
+}
+
+.video-composer__audio audio {
+  width: 100%;
+  height: 32px;
+}
+
+.video-composer__error {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 7px;
+  background: rgba(239, 68, 68, 0.1);
+  color: #fca5a5;
+  font-size: 11px;
+}
+
+.video-composer__footer {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.video-composer__compose,
+.video-composer__cancel {
+  min-height: 38px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 7px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.video-composer__compose {
+  background: var(--accent);
+  color: white;
+}
+
+.video-composer__cancel {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fca5a5;
+}
+
+.video-composer__compose:disabled,
+.video-composer-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.video-composer-node {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.video-composer-node video {
+  width: 100%;
+  height: 116px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #000;
+}
+
+.video-composer-node__empty {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.video-composer-node__progress {
+  height: 5px;
+}
+
+@media (max-width: 680px) {
+  .video-composer__settings {
+    grid-template-columns: 1fr;
+  }
+
+  .video-composer__audio {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Busy banner inside the ResultViewer actions row — explains why the

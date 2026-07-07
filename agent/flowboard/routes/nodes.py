@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +18,7 @@ NodeType = Literal[
     "prompt",
     "note",
     "visual_asset",
+    "video_composer",
     # Storyboard = thin image-node wrapper. Backend treats it the same as
     # `image` for storage / dispatch — see frontend/src/lib/storyboardPrompt.ts
     # for the template that drives gen_image.
@@ -148,6 +150,10 @@ def delete_node(node_id: int):
             select(Request).where(Request.node_id == node_id)
         ).all()
         for r in orphan_requests:
+            if r.status in ("queued", "running"):
+                r.status = "canceled"
+                r.error = "canceled"
+                r.finished_at = datetime.now(timezone.utc)
             r.node_id = None
             s.add(r)
         orphan_assets = s.exec(

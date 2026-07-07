@@ -51,8 +51,9 @@ def test_write_creates_parent_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 def test_write_sets_mode_0600(tmp_secrets_path: Path):
     """Critical — file must not be group/world readable. API keys live here."""
     secrets.write({"apiKeys": {"openai": "sk-secret"}})
-    mode = stat.S_IMODE(os.stat(tmp_secrets_path).st_mode)
-    assert mode == 0o600, f"expected 0o600 got {oct(mode)}"
+    if os.name != "nt":
+        mode = stat.S_IMODE(os.stat(tmp_secrets_path).st_mode)
+        assert mode == 0o600, f"expected 0o600 got {oct(mode)}"
 
 
 def test_write_is_atomic_no_tmp_leftover(tmp_secrets_path: Path):
@@ -109,6 +110,31 @@ def test_set_api_key_preserves_active_providers(tmp_secrets_path: Path):
     secrets.set_feature_provider("vision", "gemini")
     secrets.set_api_key("openai", "sk-key")
     assert secrets.read_active_providers()["vision"] == "gemini"
+
+
+def test_model_roundtrip_and_clear(tmp_secrets_path: Path):
+    assert secrets.get_model("nine_router") is None
+    secrets.set_model("nine_router", "GEMINI")
+    assert secrets.get_model("nine_router") == "GEMINI"
+    secrets.set_model("nine_router", None)
+    assert secrets.get_model("nine_router") is None
+
+
+def test_setting_model_preserves_keys_and_other_models(
+    tmp_secrets_path: Path,
+):
+    secrets.set_api_key("nine_router", "local-key")
+    secrets.set_model("openai", "gpt-4o")
+    secrets.set_model("nine_router", "Codex-GPT")
+
+    assert secrets.get_api_key("nine_router") == "local-key"
+    assert secrets.get_model("openai") == "gpt-4o"
+    assert secrets.get_model("nine_router") == "Codex-GPT"
+
+
+def test_get_model_rejects_non_string_value(tmp_secrets_path: Path):
+    secrets.write({"models": {"nine_router": ["not", "a", "string"]}})
+    assert secrets.get_model("nine_router") is None
 
 
 def test_read_active_providers_empty_for_fresh_install(tmp_secrets_path: Path):

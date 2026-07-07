@@ -22,6 +22,21 @@ def create_request(body: RequestCreate):
     with get_session() as s:
         if body.node_id is not None and not s.get(Node, body.node_id):
             raise HTTPException(404, "node not found")
+        if body.node_id is not None and body.type in {"gen_video", "gen_video_omni"}:
+            from sqlmodel import select
+
+            stale_video_requests = s.exec(
+                select(Request).where(
+                    Request.node_id == body.node_id,
+                    Request.type.in_(["gen_video", "gen_video_omni"]),
+                    Request.status.in_(["queued", "running"]),
+                )
+            ).all()
+            for stale in stale_video_requests:
+                stale.status = "canceled"
+                stale.error = "superseded_by_new_video_request"
+                stale.finished_at = datetime.now(timezone.utc)
+                s.add(stale)
         req = Request(
             node_id=body.node_id,
             type=body.type,

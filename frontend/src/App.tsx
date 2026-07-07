@@ -10,6 +10,7 @@ import { ReferencesPanel } from "./components/ReferencesPanel";
 import { Toaster } from "./components/Toaster";
 import { GenerationDialog } from "./components/GenerationDialog";
 import { ResultViewer } from "./components/ResultViewer";
+import { VideoComposerDialog } from "./components/VideoComposerDialog";
 import { ForcedSetupGate } from "./components/ForcedSetupGate";
 import { useBoardStore } from "./store/board";
 import { useReferencesStore } from "./store/references";
@@ -52,6 +53,7 @@ export function App() {
       <Toaster />
       <GenerationDialog />
       <ResultViewer />
+      <VideoComposerDialog />
       <ForcedSetupGate />
     </div>
   );

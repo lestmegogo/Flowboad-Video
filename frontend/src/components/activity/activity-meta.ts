@@ -13,6 +13,7 @@ export const ACTIVITY_TYPE_META: Record<
   planner:           { label: "Planner",             group: "llm" },
   gen_image:         { label: "Generate image",      group: "gen" },
   gen_video:         { label: "Generate video",      group: "gen" },
+  compose_video:     { label: "Compose video",       group: "gen" },
   edit_image:        { label: "Edit image",          group: "gen" },
   upload:            { label: "Upload (file)",       group: "upload" },
   upload_url:        { label: "Upload (link)",       group: "upload" },

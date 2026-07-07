@@ -99,7 +99,7 @@ function collectUpstreamRefMediaIds(targetRfId: string): string[] {
 
     if (chosen) ids.push(chosen);
   }
-  return ids;
+  return Array.from(new Set(ids));
 }
 
 export const useGenerationStore = create<GenerationState>((set, get) => ({
@@ -225,6 +225,12 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             });
             return;
           }
+          const rawAspect = opts.aspectRatio ?? "VIDEO_ASPECT_RATIO_PORTRAIT";
+          const normAspect =
+            rawAspect.includes("LANDSCAPE") || rawAspect.includes("16:9")
+              ? "VIDEO_ASPECT_RATIO_LANDSCAPE"
+              : "VIDEO_ASPECT_RATIO_PORTRAIT";
+
           reqDto = await createRequest({
             type: "gen_video_omni",
             node_id: isNaN(nodeDbId) ? undefined : nodeDbId,
@@ -233,8 +239,7 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
               project_id: projectId,
               ref_media_ids: ingredients,
               duration_s: settings.omniFlashDuration,
-              aspect_ratio:
-                opts.aspectRatio ?? "VIDEO_ASPECT_RATIO_PORTRAIT",
+              aspect_ratio: normAspect,
               paygate_tier:
                 opts.paygateTier ?? get().paygateTier ?? "PAYGATE_TIER_ONE",
             },
@@ -251,10 +256,16 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             set({ error: "Veo i2v requires a source image (connect an upstream image node)" });
             return;
           }
+          const rawAspect = opts.aspectRatio ?? "VIDEO_ASPECT_RATIO_LANDSCAPE";
+          const normAspect =
+            rawAspect.includes("PORTRAIT") || rawAspect.includes("SQUARE") || rawAspect.includes("9:16") || rawAspect.includes("1:1")
+              ? "VIDEO_ASPECT_RATIO_PORTRAIT"
+              : "VIDEO_ASPECT_RATIO_LANDSCAPE";
+
           const videoParams: Record<string, unknown> = {
             prompt: opts.prompt,
             project_id: projectId,
-            aspect_ratio: opts.aspectRatio ?? "VIDEO_ASPECT_RATIO_LANDSCAPE",
+            aspect_ratio: normAspect,
             // Tier precedence: explicit caller arg > auto-detected from
             // Flow > TIER_ONE fallback. The dialog no longer asks the user.
             paygate_tier:

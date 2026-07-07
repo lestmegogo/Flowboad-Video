@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from flowboard.db import get_session
 from flowboard.db.models import Request
@@ -92,6 +92,7 @@ async def _handle_gen_image(params: dict) -> tuple[dict, Optional[str]]:
     tier = params.get("paygate_tier") or flow_client.paygate_tier
     if tier is None:
         return {}, "paygate_tier_unknown"
+
     # `ref_media_ids` is the broader name (any upstream image / character /
     # visual_asset feeds in as IMAGE_INPUT_TYPE_REFERENCE). Older callers used
     # `character_media_ids` — accept both.
@@ -139,6 +140,11 @@ async def _handle_gen_image(params: dict) -> tuple[dict, Optional[str]]:
             media_service.ingest_urls(entries_with_urls)
         except Exception:  # noqa: BLE001
             logger.exception("auto-ingest from gen_image response failed")
+    from flowboard.services.media_project_sync import (
+        record_media_project_identity,
+    )
+
+    record_media_project_identity(resp.get("media_ids") or [], project_id)
     return resp, None
 
 
@@ -149,7 +155,13 @@ async def _handle_gen_image(params: dict) -> tuple[dict, Optional[str]]:
 # ``failed``) so the UI can render it as a soft auto-cancel rather than
 # a generation error.
 VIDEO_POLL_INTERVAL_S = 10.0
-VIDEO_POLL_MAX_CYCLES = 30
+VIDEO_POLL_MAX_CYCLES = 90
+OMNI_FAILURE_CONFIRM_CYCLES = 3
+# Accepted generation requests can consume credits independently, so only
+# transport failures before acceptance are eligible for automatic retries.
+OMNI_GENERATION_MAX_ATTEMPTS = 1
+OMNI_DISPATCH_MAX_ATTEMPTS = 3
+OMNI_GENERATION_RETRY_DELAY_S = 5.0
 
 
 def _is_request_canceled(rid: Optional[int]) -> bool:
@@ -167,6 +179,60 @@ def _is_request_canceled(rid: Optional[int]) -> bool:
         if req is None:
             return True
         return req.status == "canceled"
+
+
+def _set_request_progress(
+    rid: Optional[int],
+    stage: str,
+    **extra: object,
+) -> None:
+    """Best-effort progress metadata for long-running activity rows.
+
+    The Activity panel already has the Request row while a video is running;
+    updating ``result.progress`` lets us see whether time is being spent in
+    reference sync, Flow dispatch/captcha, or render polling without changing
+    the visible node layout.
+    """
+    if not isinstance(rid, int):
+        return
+    try:
+        with get_session() as s:
+            req = s.get(Request, rid)
+            if req is None or req.status == "canceled":
+                return
+            result = dict(req.result or {})
+            progress = dict(result.get("progress") or {})
+            progress.update(
+                {
+                    "stage": stage,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    **extra,
+                }
+            )
+            result["progress"] = progress
+            req.result = result
+            s.add(req)
+            s.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("request progress update failed for rid=%s", rid)
+
+
+def _merge_request_result(rid: Optional[int], **extra: object) -> None:
+    """Best-effort merge into Request.result while a long job is running."""
+    if not isinstance(rid, int):
+        return
+    try:
+        with get_session() as s:
+            req = s.get(Request, rid)
+            if req is None or req.status == "canceled":
+                return
+            result = dict(req.result or {})
+            result.update(extra)
+            req.result = result
+            s.add(req)
+            s.commit()
+    except Exception:  # noqa: BLE001
+        logger.debug("request result merge failed for rid=%s", rid)
 
 
 async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
@@ -224,7 +290,8 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
         return dispatch, "no_operations_returned"
     # NEW low-priority models return workflows (`{name, primary_media_id}`)
     # instead of operations; the SDK surfaces them on `dispatch["workflows"]`
-    # so we can route the poll to /v1/media/<id> instead of batchCheckAsync.
+    # so we can resolve media through Flow's authenticated redirect endpoint
+    # instead of batchCheckAsync.
     workflows = dispatch.get("workflows") or None
 
     poll_attempts = 0
@@ -344,10 +411,6 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
             media_service.ingest_urls(entries_with_urls)
         except Exception:  # noqa: BLE001
             logger.exception("auto-ingest from gen_video response failed")
-    # Workflow-mode (Low Priority) deliveries arrive inline as base64 MP4
-    # bytes on the `/v1/media/<id>` poll — there is no GCS URL to chase.
-    # Plant the bytes in the local cache directly so the `/media/<id>` route
-    # serves them like any URL-backed asset.
     for entry in succeeded_entries:
         if not isinstance(entry, dict):
             continue
@@ -357,13 +420,18 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
             continue
         try:
             import base64 as _b64
+
             media_service.ingest_inline_bytes(
-                mid, _b64.b64decode(encoded, validate=False),
-                kind="video", mime="video/mp4",
+                mid,
+                _b64.b64decode(encoded, validate=False),
+                kind="video",
+                mime="video/mp4",
             )
         except Exception:  # noqa: BLE001
-            logger.exception("inline ingest from workflow-mode poll failed for %s", mid)
-
+            logger.exception(
+                "inline ingest from workflow-mode poll failed for %s",
+                mid,
+            )
     partial_error: Optional[str] = None
     if op_errors:
         # De-dup distinct error codes for a compact one-line summary
@@ -469,6 +537,8 @@ async def _handle_gen_video_omni(params: dict) -> tuple[dict, Optional[str]]:
         )
     ref_media_ids = [m for m in raw_refs if isinstance(m, str) and m.strip()]
     duration_s = params.get("duration_s")
+    if isinstance(duration_s, str) and duration_s.strip().isdigit():
+        duration_s = int(duration_s.strip())
 
     if not isinstance(prompt, str) or not prompt.strip():
         return {}, "missing_prompt"
@@ -494,17 +564,54 @@ async def _handle_gen_video_omni(params: dict) -> tuple[dict, Optional[str]]:
     # local cache and substitute the project-local id before dispatch.
     # First sync hits the Flow upload endpoint per ref; subsequent
     # syncs use the MediaProjectMapping cache and are free.
+    rid = params.get("__request_id")
+    handler_started = time.perf_counter()
+    dispatch_attempt_timings: list[dict[str, object]] = []
+    timings: dict[str, object] = {
+        "ref_count": len(ref_media_ids),
+        "dispatch_attempts_s": dispatch_attempt_timings,
+    }
+
+    def _final_timings() -> dict[str, object]:
+        return {
+            **timings,
+            "total_handler_s": round(
+                time.perf_counter() - handler_started,
+                3,
+            ),
+        }
+
+    _set_request_progress(
+        rid,
+        "syncing_references",
+        ref_count=len(ref_media_ids),
+    )
+    sync_started = time.perf_counter()
     try:
         synced_refs, sync_failures = await ensure_media_ids_in_project(
             ref_media_ids, project_id
         )
     except MediaSyncError as exc:
-        return {}, f"sync_failed: {exc}"[:200]
+        timings["sync_refs_s"] = round(
+            time.perf_counter() - sync_started,
+            3,
+        )
+        return {"timings": _final_timings()}, f"sync_failed: {exc}"[:200]
+    sync_elapsed_s = round(time.perf_counter() - sync_started, 3)
+    timings["sync_refs_s"] = sync_elapsed_s
+    timings["synced_ref_count"] = len(synced_refs)
+    _set_request_progress(
+        rid,
+        "references_ready",
+        ref_count=len(ref_media_ids),
+        synced_ref_count=len(synced_refs),
+        sync_refs_s=sync_elapsed_s,
+    )
     if not synced_refs:
         # Every ref failed to sync — surface the first reason.
         first = sync_failures[0][1] if sync_failures else "no_refs_synced"
         return (
-            {"sync_failures": sync_failures},
+            {"sync_failures": sync_failures, "timings": _final_timings()},
             f"sync_failed: {first}"[:200],
         )
     if sync_failures:
@@ -515,137 +622,649 @@ async def _handle_gen_video_omni(params: dict) -> tuple[dict, Optional[str]]:
         )
 
     sdk = get_flow_sdk()
-    dispatch = await sdk.gen_video_omni(
-        prompt=prompt.strip(),
-        project_id=project_id,
-        ref_media_ids=synced_refs,
-        duration_s=duration_s,
-        aspect_ratio=aspect,
-        paygate_tier=tier,
-    )
-    if dispatch.get("error"):
-        return dispatch, str(dispatch["error"])[:200]
+    attempt_summaries: list[dict] = []
+    dispatch_summaries: list[dict] = []
+    last_failure_result: dict = {}
+    last_failure = "unknown_video_generation_error"
 
-    op_names = dispatch.get("operation_names") or []
-    if not op_names:
-        return dispatch, "no_operations_returned"
-    workflows = dispatch.get("workflows") or None
-
-    poll_attempts = 0
-    last_poll: dict = {}
-    done_by_name: dict[str, bool] = {name: False for name in op_names}
-    entry_by_name: dict[str, dict] = {}
-    op_errors: dict[str, str] = {}
-    rid = params.get("__request_id")
-
-    while (
-        poll_attempts < VIDEO_POLL_MAX_CYCLES
-        and not all(done_by_name.values())
-    ):
-        await asyncio.sleep(VIDEO_POLL_INTERVAL_S)
-        poll_attempts += 1
+    for generation_attempt in range(1, OMNI_GENERATION_MAX_ATTEMPTS + 1):
         if _is_request_canceled(rid):
             return (
                 {
+                    "canceled": True,
+                    "generation_attempt": generation_attempt,
+                    "attempts": attempt_summaries,
+                    "dispatch_attempts": dispatch_summaries,
+                    "timings": _final_timings(),
+                },
+                "canceled",
+            )
+
+        dispatch: dict = {}
+        dispatch_failure = "unknown_dispatch_error"
+        for dispatch_attempt in range(1, OMNI_DISPATCH_MAX_ATTEMPTS + 1):
+            if _is_request_canceled(rid):
+                return (
+                    {
+                        "canceled": True,
+                        "generation_attempt": generation_attempt,
+                        "attempts": attempt_summaries,
+                        "dispatch_attempts": dispatch_summaries,
+                        "timings": _final_timings(),
+                    },
+                    "canceled",
+                )
+            _set_request_progress(
+                rid,
+                "submitting_to_flow",
+                generation_attempt=generation_attempt,
+                dispatch_attempt=dispatch_attempt,
+                elapsed_s=round(
+                    time.perf_counter() - handler_started,
+                    3,
+                ),
+            )
+            dispatch_started = time.perf_counter()
+            dispatch = await sdk.gen_video_omni(
+                prompt=prompt.strip(),
+                project_id=project_id,
+                ref_media_ids=synced_refs,
+                duration_s=duration_s,
+                aspect_ratio=aspect,
+                paygate_tier=tier,
+            )
+            dispatch_elapsed_s = round(
+                time.perf_counter() - dispatch_started,
+                3,
+            )
+            dispatch_ops = dispatch.get("operation_names") or []
+            _merge_request_result(
+                rid,
+                raw_dispatch=dispatch,
+                generation_attempt=generation_attempt,
+                dispatch_attempt=dispatch_attempt,
+                dispatch_s=dispatch_elapsed_s,
+                operation_names=dispatch_ops,
+            )
+            dispatch_attempt_timings.append(
+                {
+                    "generation_attempt": generation_attempt,
+                    "dispatch_attempt": dispatch_attempt,
+                    "elapsed_s": dispatch_elapsed_s,
+                }
+            )
+            dispatch_error = dispatch.get("error")
+            if not dispatch_error and dispatch_ops:
+                timings["last_dispatch_s"] = dispatch_elapsed_s
+                _set_request_progress(
+                    rid,
+                    "flow_submitted",
+                    generation_attempt=generation_attempt,
+                    dispatch_s=dispatch_elapsed_s,
+                    operation_names=dispatch_ops,
+                    elapsed_s=round(
+                        time.perf_counter() - handler_started,
+                        3,
+                    ),
+                )
+                break
+            dispatch_failure = (
+                str(dispatch_error)[:200]
+                if dispatch_error
+                else "no_operations_returned"
+            )
+            dispatch_summaries.append(
+                {
+                    "generation_attempt": generation_attempt,
+                    "dispatch_attempt": dispatch_attempt,
+                    "error": dispatch_failure,
+                }
+            )
+            if dispatch_attempt < OMNI_DISPATCH_MAX_ATTEMPTS:
+                await asyncio.sleep(OMNI_GENERATION_RETRY_DELAY_S)
+        else:
+            return (
+                {
+                    "raw_dispatch": dispatch,
+                    "generation_attempt": generation_attempt - 1,
+                    "attempts": attempt_summaries,
+                    "dispatch_attempts": dispatch_summaries,
+                    "timings": _final_timings(),
+                },
+                (
+                    "Could not submit video to Google Flow after "
+                    f"{OMNI_DISPATCH_MAX_ATTEMPTS} attempts: "
+                    f"{dispatch_failure}"
+                ),
+            )
+
+        if dispatch.get("error"):
+            last_failure = str(dispatch["error"])[:200]
+            attempt_summaries.append(
+                {
+                    "attempt": generation_attempt,
+                    "error": last_failure,
+                    "poll_attempts": 0,
+                }
+            )
+            last_failure_result = {"raw_dispatch": dispatch}
+        else:
+            op_names = dispatch.get("operation_names") or []
+            if not op_names:
+                last_failure = "no_operations_returned"
+                attempt_summaries.append(
+                    {
+                        "attempt": generation_attempt,
+                        "error": last_failure,
+                        "poll_attempts": 0,
+                    }
+                )
+                last_failure_result = {"raw_dispatch": dispatch}
+            else:
+                workflows = dispatch.get("workflows") or None
+                poll_attempts = 0
+                last_poll: dict = {}
+                done_by_name: dict[str, bool] = {
+                    name: False for name in op_names
+                }
+                entry_by_name: dict[str, dict] = {}
+                op_errors: dict[str, str] = {}
+                failure_candidates: dict[str, tuple[str, int]] = {}
+                poll_started = time.perf_counter()
+
+                while (
+                    poll_attempts < VIDEO_POLL_MAX_CYCLES
+                    and not all(done_by_name.values())
+                ):
+                    await asyncio.sleep(VIDEO_POLL_INTERVAL_S)
+                    poll_attempts += 1
+                    if _is_request_canceled(rid):
+                        attempt_summaries.append(
+                            {
+                                "attempt": generation_attempt,
+                                "operation_names": op_names,
+                                "error": "canceled",
+                                "poll_attempts": poll_attempts,
+                            }
+                        )
+                        return (
+                            {
+                                "raw_dispatch": dispatch,
+                                "last_poll": last_poll,
+                                "operation_names": op_names,
+                                "done": done_by_name,
+                                "canceled": True,
+                                "generation_attempt": generation_attempt,
+                                "attempts": attempt_summaries,
+                                "dispatch_attempts": dispatch_summaries,
+                                "timings": _final_timings(),
+                            },
+                            "canceled",
+                        )
+                    last_poll = await sdk.check_async(
+                        op_names, workflows=workflows
+                    )
+                    timings["last_poll_attempts"] = poll_attempts
+                    timings["last_poll_s"] = round(
+                        time.perf_counter() - poll_started,
+                        3,
+                    )
+                    _set_request_progress(
+                        rid,
+                        "waiting_for_flow_video",
+                        generation_attempt=generation_attempt,
+                        poll_attempts=poll_attempts,
+                        poll_max=VIDEO_POLL_MAX_CYCLES,
+                        poll_elapsed_s=timings["last_poll_s"],
+                        operation_names=op_names,
+                        elapsed_s=round(
+                            time.perf_counter() - handler_started,
+                            3,
+                        ),
+                    )
+                    if last_poll.get("error"):
+                        continue
+                    for op in last_poll.get("operations") or []:
+                        if not isinstance(op, dict):
+                            continue
+                        name = op.get("name")
+                        if (
+                            not isinstance(name, str)
+                            or done_by_name.get(name, False)
+                        ):
+                            continue
+                        candidate = op.get("failure_candidate")
+                        if isinstance(candidate, str) and candidate:
+                            previous, count = failure_candidates.get(
+                                name,
+                                (candidate, 0),
+                            )
+                            next_count = (
+                                count + 1 if previous == candidate else 1
+                            )
+                            failure_candidates[name] = (
+                                candidate,
+                                next_count,
+                            )
+                            if next_count >= OMNI_FAILURE_CONFIRM_CYCLES:
+                                done_by_name[name] = True
+                                op_errors[name] = (
+                                    "Flow video failed before media was "
+                                    f"produced: {candidate}"
+                            )
+                            continue
+                        failure_candidates.pop(name, None)
+                        err = op.get("error")
+                        if isinstance(err, str) and err:
+                            done_by_name[name] = True
+                            op_errors[name] = err
+                            continue
+                        if op.get("done"):
+                            done_by_name[name] = True
+                            for e in op.get("media_entries") or []:
+                                if (
+                                    isinstance(e, dict)
+                                    and e.get("media_id")
+                                ):
+                                    entry_by_name[name] = e
+                                    break
+
+                for name in op_names:
+                    if (
+                        not done_by_name.get(name)
+                        and name not in op_errors
+                    ):
+                        op_errors[name] = "timeout_waiting_video"
+
+                positional_ids: list[Optional[str]] = []
+                slot_errors: list[Optional[str]] = []
+                succeeded_entries: list[dict] = []
+                for name in op_names:
+                    entry = entry_by_name.get(name)
+                    if (
+                        isinstance(entry, dict)
+                        and isinstance(entry.get("media_id"), str)
+                    ):
+                        positional_ids.append(entry["media_id"])
+                        succeeded_entries.append(entry)
+                        slot_errors.append(None)
+                    else:
+                        positional_ids.append(None)
+                        slot_errors.append(op_errors.get(name))
+
+                if any(positional_ids):
+                    attempt_summaries.append(
+                        {
+                            "attempt": generation_attempt,
+                            "operation_names": op_names,
+                            "error": None,
+                            "poll_attempts": poll_attempts,
+                        }
+                    )
+                    entries_with_urls = [
+                        entry
+                        for entry in succeeded_entries
+                        if isinstance(entry, dict) and entry.get("url")
+                    ]
+                    if entries_with_urls:
+                        try:
+                            media_service.ingest_urls(entries_with_urls)
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "auto-ingest from gen_video_omni "
+                                "response failed"
+                            )
+                    for entry in succeeded_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        encoded = entry.get("encoded_video")
+                        mid = entry.get("media_id")
+                        if not isinstance(encoded, str) or not isinstance(mid, str):
+                            continue
+                        try:
+                            import base64 as _b64
+
+                            media_service.ingest_inline_bytes(
+                                mid,
+                                _b64.b64decode(encoded, validate=False),
+                                kind="video",
+                                mime="video/mp4",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "inline ingest from omni workflow poll "
+                                "failed for %s",
+                                mid,
+                            )
+                    return (
+                        {
+                            "raw_dispatch": dispatch,
+                            "last_poll": last_poll,
+                            "operation_names": op_names,
+                            "media_ids": positional_ids,
+                            "media_entries": succeeded_entries,
+                            "op_errors": op_errors,
+                            "slot_errors": slot_errors,
+                            "duration_s": duration_s,
+                            "generation_attempt": generation_attempt,
+                            "attempts": attempt_summaries,
+                            "dispatch_attempts": dispatch_summaries,
+                            "timings": _final_timings(),
+                        },
+                        None,
+                    )
+
+                last_failure = next(
+                    iter(op_errors.values()),
+                    "timeout_waiting_video",
+                )
+                attempt_summaries.append(
+                    {
+                        "attempt": generation_attempt,
+                        "operation_names": op_names,
+                        "error": last_failure,
+                        "poll_attempts": poll_attempts,
+                    }
+                )
+                last_failure_result = {
                     "raw_dispatch": dispatch,
                     "last_poll": last_poll,
                     "operation_names": op_names,
                     "done": done_by_name,
-                    "canceled": True,
-                },
-                "canceled",
-            )
-        last_poll = await sdk.check_async(op_names, workflows=workflows)
-        if last_poll.get("error"):
-            continue
-        for op in last_poll.get("operations") or []:
-            if not isinstance(op, dict):
-                continue
-            name = op.get("name")
-            if not isinstance(name, str) or done_by_name.get(name, False):
-                continue
-            err = op.get("error")
-            if isinstance(err, str) and err:
-                done_by_name[name] = True
-                op_errors[name] = err
-                continue
-            if op.get("done"):
-                done_by_name[name] = True
-                for e in op.get("media_entries") or []:
-                    if isinstance(e, dict) and e.get("media_id"):
-                        entry_by_name[name] = e
-                        break
+                    "op_errors": op_errors,
+                }
+                if op_errors and all(
+                    err == "timeout_waiting_video"
+                    for err in op_errors.values()
+                ):
+                    last_failure_result.update(
+                        {
+                            "generation_attempt": generation_attempt,
+                            "attempts": attempt_summaries,
+                            "dispatch_attempts": dispatch_summaries,
+                            "timings": _final_timings(),
+                        }
+                    )
+                    return last_failure_result, "timeout_waiting_video"
 
-    for name in op_names:
-        if not done_by_name.get(name) and name not in op_errors:
-            op_errors[name] = "timeout_waiting_video"
+        if generation_attempt < OMNI_GENERATION_MAX_ATTEMPTS:
+            await asyncio.sleep(OMNI_GENERATION_RETRY_DELAY_S)
 
-    positional_ids: list[Optional[str]] = []
-    slot_errors: list[Optional[str]] = []
-    succeeded_entries: list[dict] = []
-    for name in op_names:
-        e = entry_by_name.get(name)
-        if isinstance(e, dict) and isinstance(e.get("media_id"), str):
-            positional_ids.append(e["media_id"])
-            succeeded_entries.append(e)
-            slot_errors.append(None)
-        else:
-            positional_ids.append(None)
-            slot_errors.append(op_errors.get(name))
+    last_failure_result.update(
+        {
+            "generation_attempt": OMNI_GENERATION_MAX_ATTEMPTS,
+            "attempts": attempt_summaries,
+            "dispatch_attempts": dispatch_summaries,
+            "timings": _final_timings(),
+        }
+    )
+    return (
+        last_failure_result,
+        (
+            "Flow video failed after "
+            f"{OMNI_GENERATION_MAX_ATTEMPTS} "
+            f"{'attempt' if OMNI_GENERATION_MAX_ATTEMPTS == 1 else 'attempts'}: "
+            f"{last_failure}"
+        ),
+    )
 
-    if not any(positional_ids):
-        first_err = next(iter(op_errors.values()), "timeout_waiting_video")
-        return (
-            {
-                "raw_dispatch": dispatch,
-                "last_poll": last_poll,
-                "operation_names": op_names,
-                "done": done_by_name,
-                "op_errors": op_errors,
-            },
-            first_err,
-        )
 
-    entries_with_urls = [
-        e for e in succeeded_entries if isinstance(e, dict) and e.get("url")
+async def _handle_compose_video(
+    params: dict,
+) -> tuple[dict, Optional[str]]:
+    import math
+    import uuid
+    from pathlib import Path
+
+    from sqlmodel import select
+
+    from flowboard.db.models import Asset, Edge, Node
+    from flowboard.services.video_composer import (
+        ComposerCanceled,
+        compose_video,
+    )
+
+    node_id = params.get("__node_id")
+    request_id = params.get("__request_id")
+    if not isinstance(node_id, int):
+        return {}, "missing_node_id"
+
+    aspect_ratio = params.get("aspect_ratio", "9:16")
+    audio_mode = params.get("audio_mode", "original")
+    audio_media_id = params.get("audio_media_id")
+    raw_order = params.get("video_order")
+    video_order = [
+        item for item in raw_order or [] if isinstance(item, str) and item
     ]
-    if entries_with_urls:
-        try:
-            media_service.ingest_urls(entries_with_urls)
-        except Exception:  # noqa: BLE001
-            logger.exception("auto-ingest from gen_video_omni response failed")
-    # Omni Flash uses workflow-mode polling: Flow delivers the rendered MP4
-    # inline as base64 on `/v1/media/<id>` with no signed GCS URL. Plant the
-    # bytes in the local cache so `/media/<id>` can serve them.
-    for entry in succeeded_entries:
-        if not isinstance(entry, dict):
-            continue
-        encoded = entry.get("encoded_video")
-        mid = entry.get("media_id")
-        if not isinstance(encoded, str) or not isinstance(mid, str):
-            continue
-        try:
-            import base64 as _b64
-            media_service.ingest_inline_bytes(
-                mid, _b64.b64decode(encoded, validate=False),
-                kind="video", mime="video/mp4",
+    try:
+        original_volume = float(params.get("original_volume", 1.0))
+        music_volume = float(params.get("music_volume", 0.2))
+    except (TypeError, ValueError):
+        return {}, "invalid_audio_volume"
+    if not math.isfinite(original_volume) or not math.isfinite(music_volume):
+        return {}, "invalid_audio_volume"
+
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None:
+            return {}, "node_not_found"
+        if node.type != "video_composer":
+            return {}, "node_must_be_video_composer"
+
+        edges = session.exec(
+            select(Edge).where(Edge.target_id == node_id)
+        ).all()
+        source_ids = {edge.source_id for edge in edges}
+        source_nodes = (
+            session.exec(select(Node).where(Node.id.in_(source_ids))).all()
+            if source_ids
+            else []
+        )
+        source_nodes = [source for source in source_nodes if source.type == "video"]
+        order_index = {value: index for index, value in enumerate(video_order)}
+        source_nodes.sort(
+            key=lambda source: (
+                order_index.get(str(source.id), len(order_index)),
+                source.x,
+                source.id or 0,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("inline ingest from omni workflow poll failed for %s", mid)
+        )
+        if not source_nodes:
+            return {}, "at_least_one_connected_video_required"
+
+        clip_media: list[tuple[str, str]] = []
+        for source in source_nodes:
+            media_id = (source.data or {}).get("mediaId")
+            if isinstance(media_id, str) and media_id:
+                clip_media.append((str(source.id), media_id))
+        if not clip_media:
+            return {}, "at_least_one_generated_video_required"
+        if len(clip_media) == 1 and audio_mode not in {"mix", "music"}:
+            return {}, "single_video_requires_background_audio"
+
+        node.status = "running"
+        node.data = {
+            **dict(node.data or {}),
+            "error": None,
+            "videoOrder": [source_id for source_id, _ in clip_media],
+            "assemblyProgress": 5,
+            "assemblyStage": "loading_media",
+        }
+        session.add(node)
+        session.commit()
+
+    clip_paths: list[Path] = []
+    for _source_id, media_id in clip_media:
+        cached = media_service.cached_path(media_id)
+        if cached is None:
+            await media_service.fetch_and_cache(media_id)
+            cached = media_service.cached_path(media_id)
+        if cached is None:
+            error = f"video_not_available:{media_id}"
+            _set_composer_node_error(node_id, error)
+            return {}, error
+        clip_paths.append(cached)
+
+    audio_path: Optional[Path] = None
+    if isinstance(audio_media_id, str) and audio_media_id:
+        audio_path = media_service.cached_path(audio_media_id)
+        if audio_path is None:
+            error = "background_audio_not_available"
+            _set_composer_node_error(node_id, error)
+            return {}, error
+    elif audio_mode in {"mix", "music"}:
+        error = "background_audio_required"
+        _set_composer_node_error(node_id, error)
+        return {}, error
+
+    output_media_id = str(uuid.uuid4())
+    output_path = media_service.MEDIA_CACHE_DIR / f"{output_media_id}.mp4"
+    try:
+        duration = await compose_video(
+            clip_paths,
+            output_path=output_path,
+            aspect_ratio=aspect_ratio,
+            audio_path=audio_path,
+            audio_mode=audio_mode,
+            original_volume=original_volume,
+            music_volume=music_volume,
+            cancel_check=lambda: _is_request_canceled(request_id),
+            progress_callback=lambda percent, stage: (
+                _set_composer_node_progress(node_id, percent, stage)
+            ),
+        )
+    except ComposerCanceled:
+        output_path.unlink(missing_ok=True)
+        _set_composer_node_idle(node_id)
+        return {"canceled": True}, "canceled"
+    except (RuntimeError, ValueError) as exc:
+        output_path.unlink(missing_ok=True)
+        logger.exception(
+            "video composer failed for node_id=%s at stage=%s",
+            node_id,
+            _get_composer_node_stage(node_id),
+        )
+        detail = str(exc).strip()
+        error = (
+            detail[:500]
+            if detail
+            else f"{type(exc).__name__}: FFmpeg composition failed"
+        )
+        _set_composer_node_error(node_id, error)
+        return {}, error
+
+    rendered_at = datetime.now(timezone.utc).isoformat()
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None:
+            output_path.unlink(missing_ok=True)
+            return {}, "node_deleted_during_composition"
+        session.add(
+            Asset(
+                uuid_media_id=output_media_id,
+                kind="video",
+                mime="video/mp4",
+                local_path=str(output_path),
+                node_id=node_id,
+            )
+        )
+        node.status = "done"
+        node.data = {
+            **dict(node.data or {}),
+            "mediaId": output_media_id,
+            "mediaIds": [output_media_id],
+            "variantCount": 1,
+            "videoOrder": [source_id for source_id, _ in clip_media],
+            "audioMediaId": audio_media_id,
+            "audioMode": audio_mode,
+            "originalVolume": original_volume,
+            "musicVolume": music_volume,
+            "aspectRatio": aspect_ratio,
+            "durationS": duration,
+            "renderedAt": rendered_at,
+            "assemblyProgress": 100,
+            "assemblyStage": "completed",
+            "error": None,
+        }
+        session.add(node)
+        session.commit()
 
     return (
         {
-            "raw_dispatch": dispatch,
-            "last_poll": last_poll,
-            "operation_names": op_names,
-            "media_ids": positional_ids,
-            "media_entries": succeeded_entries,
-            "op_errors": op_errors,
-            "slot_errors": slot_errors,
-            "duration_s": duration_s,
+            "media_ids": [output_media_id],
+            "clip_count": len(clip_paths),
+            "duration_s": duration,
+            "aspect_ratio": aspect_ratio,
+            "audio_mode": audio_mode,
         },
         None,
     )
+
+
+def _set_composer_node_error(node_id: int, error: str) -> None:
+    from flowboard.db.models import Node
+
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None:
+            return
+        safe_error = error.strip() or "Video composition failed without details"
+        node.status = "error"
+        node.data = {
+            **dict(node.data or {}),
+            "assemblyStage": "failed",
+            "error": safe_error,
+        }
+        session.add(node)
+        session.commit()
+
+
+def _set_composer_node_idle(node_id: int) -> None:
+    from flowboard.db.models import Node
+
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None:
+            return
+        node.status = "idle"
+        node.data = {
+            **dict(node.data or {}),
+            "assemblyProgress": 0,
+            "assemblyStage": "idle",
+            "error": None,
+        }
+        session.add(node)
+        session.commit()
+
+
+def _get_composer_node_stage(node_id: int) -> str:
+    from flowboard.db.models import Node
+
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None:
+            return "unknown"
+        return str((node.data or {}).get("assemblyStage") or "unknown")
+
+
+def _set_composer_node_progress(
+    node_id: int,
+    percent: int,
+    stage: str,
+) -> None:
+    from flowboard.db.models import Node
+
+    with get_session() as session:
+        node = session.get(Node, node_id)
+        if node is None or node.status not in {"queued", "running"}:
+            return
+        node.data = {
+            **dict(node.data or {}),
+            "assemblyProgress": max(0, min(99, int(percent))),
+            "assemblyStage": stage,
+        }
+        session.add(node)
+        session.commit()
 
 
 _DEFAULT_HANDLERS: dict[str, Handler] = {
@@ -654,6 +1273,7 @@ _DEFAULT_HANDLERS: dict[str, Handler] = {
     "gen_image": _handle_gen_image,
     "gen_video": _handle_gen_video,
     "gen_video_omni": _handle_gen_video_omni,
+    "compose_video": _handle_compose_video,
     "edit_image": _handle_edit_image,
 }
 
@@ -762,11 +1382,18 @@ class WorkerController:
                     return
                 req.result = result if isinstance(result, dict) else {"value": result}
                 req.finished_at = datetime.now(timezone.utc)
-                if err:
+                if err is not None:
+                    error_text = str(err).strip() or (
+                        "request_failed_without_error_details"
+                    )
                     # Video-poll exhaustion gets its own status so the UI
                     # can render "TIMEOUT" instead of a generic failure.
-                    req.status = "timeout" if err == "timeout_waiting_video" else "failed"
-                    req.error = err
+                    req.status = (
+                        "timeout"
+                        if error_text == "timeout_waiting_video"
+                        else "failed"
+                    )
+                    req.error = error_text
                 else:
                     req.status = "done"
                     req.error = None

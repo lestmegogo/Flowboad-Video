@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from flowboard.services.llm import registry, secrets
@@ -192,51 +193,37 @@ async def test_run_forwards_all_kwargs(tmp_secrets_path, fake_providers):
     assert call["timeout"] == 42.0
 
 
-# ── Real ClaudeProvider smoke (no actual subprocess) ───────────────────
+# ── Real ClaudeProvider smoke (no actual HTTP calls) ───────────────────
 
 @pytest.mark.asyncio
-async def test_real_claude_provider_wraps_cli_error_as_llm_error():
-    """Contract: caller doing `except LLMError:` must catch every Claude
-    failure mode. The provider translates `ClaudeCliError` → `LLMError`
-    so callers never have to import claude_cli to handle errors. Without
-    the wrap, every Claude timeout / non-zero exit / bad envelope would
-    leak through as the wrong exception type."""
-    from flowboard.services import claude_cli
+async def test_real_claude_provider_wraps_http_error_as_llm_error(tmp_secrets_path):
     from flowboard.services.llm.claude import ClaudeProvider
-
+    secrets.set_api_key("claude", "sk-test")
     p = ClaudeProvider()
-    with patch(
-        "flowboard.services.claude_cli.run_claude",
-        side_effect=claude_cli.ClaudeCliError("subprocess timeout"),
-    ):
-        with pytest.raises(LLMError, match="subprocess timeout"):
+    with patch("httpx.AsyncClient.post", side_effect=httpx.TimeoutException("timed out")):
+        with pytest.raises(LLMError, match="timed out"):
             await p.run("hello")
-    # Cause chain preserved for diagnostics — the original ClaudeCliError
-    # is still reachable via __cause__ if a logger / debugger wants it.
 
 
 @pytest.mark.asyncio
-async def test_real_claude_provider_delegates_to_claude_cli():
-    """Sanity check that ClaudeProvider actually wires through to
-    claude_cli.run_claude — caught early if the function signature drifts.
-    Uses patches, never spawns a real claude binary."""
+async def test_real_claude_provider_calls_anthropic_api(tmp_secrets_path):
     from flowboard.services.llm.claude import ClaudeProvider
-
+    secrets.set_api_key("claude", "sk-test")
     p = ClaudeProvider()
     assert p.name == "claude"
     assert p.supports_vision is True
 
-    with patch(
-        "flowboard.services.claude_cli.run_claude",
-        return_value="mocked-result",
-    ) as mock_run, patch(
-        "flowboard.services.claude_cli.is_available",
-        return_value=True,
-    ):
-        out = await p.run("hello", system_prompt="s", attachments=["/x.jpg"], timeout=5.0)
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.json = lambda: {
+        "content": [{"text": "mocked-result"}]
+    }
+
+    with patch("httpx.AsyncClient.post", return_value=mock_resp) as mock_post:
+        out = await p.run("hello", system_prompt="s", timeout=5.0)
     assert out == "mocked-result"
-    mock_run.assert_called_once()
-    kwargs = mock_run.call_args.kwargs
-    assert kwargs["system_prompt"] == "s"
-    assert kwargs["attachments"] == ["/x.jpg"]
-    assert kwargs["timeout"] == 5.0
+    mock_post.assert_called_once()
+    kwargs = mock_post.call_args.kwargs
+    assert kwargs["headers"]["x-api-key"] == "sk-test"
+    assert kwargs["json"]["system"] == "s"
+    assert kwargs["json"]["model"] == "claude-3-5-sonnet-latest"

@@ -25,7 +25,6 @@ from pydantic import BaseModel
 
 from flowboard.services.llm import registry, secrets
 from flowboard.services.llm.base import LLMError
-from flowboard.services import claude_cli
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,11 @@ class _ApiKeyBody(BaseModel):
     apiKey: Optional[str] = None
 
 
+class _ModelBody(BaseModel):
+    """PUT /api/llm/providers/{name}/model: `model: null` clears the model."""
+    model: Optional[str] = None
+
+
 class _ConfigBody(BaseModel):
     """PUT /api/llm/config: any subset of the three features."""
     auto_prompt: Optional[str] = None
@@ -50,7 +54,7 @@ class _ConfigBody(BaseModel):
 # Whitelist for the writable feature → provider mapping. Hand-edited
 # secrets.json with garbage values is tolerated by `read_active_providers`,
 # but the HTTP surface must reject input that wouldn't route anywhere.
-_VALID_PROVIDER_NAMES = {"claude", "gemini", "openai"}
+_VALID_PROVIDER_NAMES = {"claude", "gemini", "openai", "nine_router"}
 _VALID_FEATURES = ("auto_prompt", "vision", "planner")
 
 
@@ -59,10 +63,11 @@ _VALID_FEATURES = ("auto_prompt", "vision", "planner")
 
 @router.post("/debug/reset-probe")
 async def debug_reset_probe() -> dict:
-    """Force re-probe Claude CLI (debug endpoint)."""
-    claude_cli.reset_availability_cache()
-    available = await claude_cli.is_available(force=True)
-    return {"ok": True, "claude_available": available}
+    """Force re-probe (debug endpoint)."""
+    for provider in registry.list_providers():
+        if hasattr(provider, "reset_cache"):
+            provider.reset_cache()
+    return {"ok": True}
 
 
 @router.get("/providers")
@@ -71,36 +76,21 @@ async def list_providers() -> list[dict]:
 
     Each entry carries everything the UI needs to render the right row
     state without follow-up calls. `configured` reports whether the user
-    has done setup (CLI: same as `available`; API: key present, regardless
-    of test outcome). `mode` is meaningful only for OpenAI ("cli"/"api"/"none").
+    has done setup (API: key present, regardless of test outcome).
     """
     out: list[dict] = []
     for provider in registry.list_providers():
-        # CLI providers: available implies configured. API providers:
-        # `configured` means a key exists; `available` adds "key works"
-        # via the cached probe. Splitting the two lets the UI distinguish
-        # "user has set things up but the key is bad" from "user hasn't
-        # set anything up yet".
         available = await provider.is_available()
-        if provider.name == "openai":
-            mode = provider.mode  # type: ignore[attr-defined]
-            configured = (
-                bool(secrets.get_api_key("openai"))
-                or getattr(provider, "_cli_available", False)
-            )
-            requires_key = False  # CLI path doesn't require it
-        else:
-            mode = "cli"
-            configured = available
-            requires_key = False
+        configured = bool(secrets.get_api_key(provider.name))
 
         out.append({
             "name": provider.name,
             "supportsVision": provider.supports_vision,
             "available": available,
             "configured": configured,
-            "requiresKey": requires_key,
-            "mode": mode,
+            "requiresKey": True,
+            "mode": "api",
+            "selectedModel": secrets.get_model(provider.name),
         })
     return out
 
@@ -110,19 +100,9 @@ async def list_providers() -> list[dict]:
 
 @router.put("/providers/{name}")
 async def set_provider_key(name: str, body: _ApiKeyBody) -> dict:
-    """Save (or clear, when `apiKey: null`) a provider's API key.
-
-    Only OpenAI's API mode accepts keys (its CLI path doesn't need one).
-    Setting a key on a CLI-only provider is a 400 — the UI shouldn't
-    reach this endpoint for them in the first place, but defend in depth.
-    """
+    """Save (or clear, when `apiKey: null`) a provider's API key."""
     if name not in _VALID_PROVIDER_NAMES:
         raise HTTPException(status_code=404, detail=f"unknown provider {name!r}")
-    if name != "openai":
-        raise HTTPException(
-            status_code=400,
-            detail=f"{name} doesn't accept API keys; uses CLI auth instead",
-        )
     secrets.set_api_key(name, body.apiKey)
     # Bust the relevant provider's availability cache so the next /providers
     # poll reflects the change immediately rather than waiting up to 60s.
@@ -133,17 +113,56 @@ async def set_provider_key(name: str, body: _ApiKeyBody) -> dict:
     return {"ok": True}
 
 
+# ── PUT /api/llm/providers/{name}/model ─────────────────────────────────
+
+
+@router.put("/providers/{name}/model")
+async def set_provider_model(name: str, body: _ModelBody) -> dict:
+    """Save (or clear, when `model: null`) a provider's configured model."""
+    if name not in _VALID_PROVIDER_NAMES:
+        raise HTTPException(status_code=404, detail=f"unknown provider {name!r}")
+    secrets.set_model(name, body.model)
+    logger.info("llm: model set to %s for %s", body.model, name)
+    return {"ok": True}
+
+
+# ── GET /api/llm/providers/{name}/models ────────────────────────────────
+
+
+@router.get("/providers/{name}/models")
+async def get_provider_models(name: str) -> list[str]:
+    """Retrieve list of available models for a provider by querying its API."""
+    if name not in _VALID_PROVIDER_NAMES:
+        raise HTTPException(status_code=404, detail=f"unknown provider {name!r}")
+    provider = registry.get_provider(name)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="provider not registered")
+
+    # If the provider implements list_models, call it to fetch from its API
+    if hasattr(provider, "list_models"):
+        try:
+            return await provider.list_models()
+        except Exception as exc:
+            logger.warning("Failed to fetch models for %s: %s", name, exc)
+
+    # Default fallback models when key is missing or call fails
+    if name == "claude":
+        return ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"]
+    elif name == "gemini":
+        return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
+    elif name == "openai":
+        return ["gpt-4o", "gpt-4o-mini", "o1-mini", "o3-mini"]
+    elif name == "nine_router":
+        return ["kr/claude-sonnet-4.5", "gemini/gemini-2.5-flash", "Codex-GPT", "GEMINI", "Kiro"]
+    return []
+
+
 # ── POST /api/llm/providers/{name}/test ───────────────────────────────
 
 
 @router.post("/providers/{name}/test")
 async def test_provider(name: str) -> dict:
-    """Ping the provider with a tiny prompt and report success / latency.
-
-    Cost: ~1 token in + ~1 token out. Used by the Settings panel's "Test"
-    button. Returns `{ok, latencyMs}` on success or `{ok: false, error}`
-    on any failure mode.
-    """
+    """Ping the provider with a tiny prompt and report success / latency."""
     if name not in _VALID_PROVIDER_NAMES:
         raise HTTPException(status_code=404, detail=f"unknown provider {name!r}")
     provider = registry.get_provider(name)

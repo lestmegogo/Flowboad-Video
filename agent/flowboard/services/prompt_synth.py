@@ -534,7 +534,7 @@ async def auto_prompt_batch(
             # finishes the same call in 5-15s; we err on Gemini's side
             # so feature parity holds across providers.
             text = await run_llm(
-                "auto_prompt", user_msg, system_prompt=system_prompt, timeout=120.0
+                "auto_prompt", user_msg, system_prompt=system_prompt, timeout=300.0
             )
         except LLMError as exc:
             raise PromptSynthError(f"auto-prompt provider failed: {exc}") from exc
@@ -606,7 +606,7 @@ async def auto_prompt(node_id: int, *, camera: Optional[str] = None) -> str:
                 "auto_prompt",
                 user_msg,
                 system_prompt=system_prompt,
-                timeout=90.0,
+                timeout=300.0,
             )
         except LLMError as exc:
             raise PromptSynthError(f"auto-prompt provider failed: {exc}") from exc

@@ -48,6 +48,12 @@ _EXT_BY_MIME = {
     "image/gif": ".gif",
     "video/mp4": ".mp4",
     "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/ogg": ".ogg",
 }
 
 
@@ -115,10 +121,9 @@ def ingest_inline_bytes(
 ) -> bool:
     """Cache pre-fetched media bytes and mark the Asset as locally available.
 
-    Used by workflow-mode video poll (Low Priority models) where Flow returns
-    base64-encoded MP4 inline on ``/v1/media/<id>`` instead of a signed GCS
-    URL. The bytes never traverse ``fetch_and_cache`` so we plant them here
-    and the existing ``/media/<id>`` route serves them like any other asset.
+    Retained for provider responses that deliver bytes inline instead of a
+    signed CDN URL. The bytes never traverse ``fetch_and_cache``, so this
+    plants them directly for the existing ``/media/<id>`` route.
     """
     if not is_valid_media_id(media_id) or not data:
         return False

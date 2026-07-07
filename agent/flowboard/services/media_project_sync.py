@@ -24,18 +24,22 @@ Cache semantics:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import time
 from typing import Optional
 
 from sqlmodel import select
 
 from flowboard.db import get_session
-from flowboard.db.models import Asset, MediaProjectMapping
+from flowboard.db.models import MediaProjectMapping
 from flowboard.services import media as media_service
 from flowboard.services.flow_sdk import get_flow_sdk
 
 logger = logging.getLogger(__name__)
+
+_SYNC_CONCURRENCY = 3
 
 
 _MIME_BY_EXT: dict[str, str] = {
@@ -51,6 +55,50 @@ class MediaSyncError(RuntimeError):
     """Raised when a reference can't be made available under the target
     project — bytes missing locally and the cached URL is dead, or the
     Flow upload itself failed."""
+
+
+def record_media_project_identity(
+    media_ids: list[str],
+    project_id: str,
+) -> None:
+    """Record media that Flow already created/uploaded inside a project."""
+    clean_ids = list(
+        dict.fromkeys(
+            media_id
+            for media_id in media_ids
+            if isinstance(media_id, str) and media_id
+        )
+    )
+    if not clean_ids or not project_id:
+        return
+
+    for media_id in clean_ids:
+        try:
+            with get_session() as session:
+                existing = session.exec(
+                    select(MediaProjectMapping)
+                    .where(
+                        MediaProjectMapping.original_media_id == media_id
+                    )
+                    .where(MediaProjectMapping.project_id == project_id)
+                ).first()
+                if existing is not None:
+                    continue
+                session.add(
+                    MediaProjectMapping(
+                        original_media_id=media_id,
+                        project_id=project_id,
+                        project_local_media_id=media_id,
+                    )
+                )
+                session.commit()
+        except Exception:  # noqa: BLE001
+            # Parallel result handling can race on the unique constraint.
+            logger.info(
+                "media identity mapping already recorded for %s in %s",
+                media_id,
+                project_id,
+            )
 
 
 async def ensure_media_in_project(
@@ -146,17 +194,49 @@ async def ensure_media_ids_in_project(
     is a list of ``(original_media_id, error_message)`` tuples for any
     refs that couldn't be synced. Successful refs are returned in input
     order; failed refs are dropped from the returned list."""
-    synced: list[str] = []
+    started = time.perf_counter()
+    semaphore = asyncio.Semaphore(_SYNC_CONCURRENCY)
+
+    async def _sync_one(index: int, media_id: str) -> tuple[int, str, Optional[str]]:
+        async with semaphore:
+            try:
+                return (
+                    index,
+                    await ensure_media_in_project(media_id, project_id),
+                    None,
+                )
+            except MediaSyncError as exc:
+                logger.warning(
+                    "media_sync skipped %s for project %s: %s",
+                    media_id, project_id, exc,
+                )
+                return index, media_id, str(exc)
+
+    results = await asyncio.gather(
+        *[
+            _sync_one(index, mid)
+            for index, mid in enumerate(media_ids)
+        ]
+    )
+
+    synced_by_index: dict[int, str] = {}
     failures: list[tuple[str, str]] = []
-    for mid in media_ids:
-        try:
-            synced.append(await ensure_media_in_project(mid, project_id))
-        except MediaSyncError as exc:
-            failures.append((mid, str(exc)))
-            logger.warning(
-                "media_sync skipped %s for project %s: %s",
-                mid, project_id, exc,
-            )
+    for index, value, error in results:
+        if error is None:
+            synced_by_index[index] = value
+        else:
+            failures.append((media_ids[index], error))
+
+    synced = [
+        synced_by_index[index]
+        for index in range(len(media_ids))
+        if index in synced_by_index
+    ]
+    elapsed_s = time.perf_counter() - started
+    logger.info(
+        "media_sync bulk: refs=%d synced=%d failed=%d elapsed=%.2fs project=%s",
+        len(media_ids), len(synced), len(failures), elapsed_s, project_id,
+    )
     return synced, failures
 
 

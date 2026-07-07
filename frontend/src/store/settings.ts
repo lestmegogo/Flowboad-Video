@@ -41,10 +41,10 @@ export type VideoModelFamily = "veo" | "omni_flash";
 // dialog so the user sees the cost before submit). Mirrors the backend
 // OMNI_FLASH_CREDIT_COST table — pin both via tests.
 export const OMNI_FLASH_CREDIT_COST: Record<4 | 6 | 8 | 10, number> = {
-  4: 15,
-  6: 20,
-  8: 25,
-  10: 30,
+  4: 7,
+  6: 10,
+  8: 12,
+  10: 15,
 };
 export type OmniFlashDuration = 4 | 6 | 8 | 10;
 export const OMNI_FLASH_DURATIONS: OmniFlashDuration[] = [4, 6, 8, 10];

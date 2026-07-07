@@ -19,6 +19,7 @@ import { useBoardStore, type FlowNode, type NodeType } from "../store/board";
 import { NodeCard } from "./NodeCard";
 import { VariantEdge } from "./VariantEdge";
 import { useGenerationStore } from "../store/generation";
+import { useVideoComposerStore } from "../store/videoComposer";
 
 const nodeTypes = {
   character: NodeCard,
@@ -28,6 +29,7 @@ const nodeTypes = {
   note: NodeCard,
   visual_asset: NodeCard,
   Storyboard: NodeCard,
+  video_composer: NodeCard,
 };
 
 // Single edge type used for everything — VariantEdge renders the
@@ -276,6 +278,10 @@ export function Board() {
 
   const onNodeDoubleClick = useCallback(
     (_event: React.MouseEvent, node: FlowNode) => {
+      if (node.data.type === "video_composer") {
+        useVideoComposerStore.getState().openComposer(node.id);
+        return;
+      }
       const isGenerable = [
         "image",
         "prompt",

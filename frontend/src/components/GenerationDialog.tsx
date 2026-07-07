@@ -1167,7 +1167,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Duration (Omni Flash)
-              <InfoTip tip="Omni Flash dispatches via video:batchAsyncGenerateVideoReferenceImages with the upstream image(s) as IMAGE_USAGE_TYPE_ASSET refs. Duration scales credit cost: 4s=15, 6s=20, 8s=25, 10s=30." />
+              <InfoTip tip="Omni Flash dispatches via video:batchAsyncGenerateVideoReferenceImages with the upstream image(s) as IMAGE_USAGE_TYPE_ASSET_IMAGE refs. Duration scales credit cost: 4s=7, 6s=10, 8s=12, 10s=15." />
             </span>
             <div className="aspect-chip-row">
               {OMNI_FLASH_DURATIONS.map((d) => {

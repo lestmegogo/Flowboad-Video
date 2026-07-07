@@ -99,6 +99,31 @@ def set_api_key(provider: str, key: Optional[str]) -> None:
     write(doc)
 
 
+# ── Model helpers ──────────────────────────────────────────────────────
+
+def get_model(provider: str) -> Optional[str]:
+    """None if the model is unset OR if the file doesn't exist."""
+    doc = read()
+    models = doc.get("models") or {}
+    val = models.get(provider)
+    return val if isinstance(val, str) and val else None
+
+
+def set_model(provider: str, model: Optional[str]) -> None:
+    """Set or clear (model=None) a provider's active model.
+
+    Clearing removes the entry entirely so ``get_model`` returns None.
+    """
+    doc = read()
+    models = dict(doc.get("models") or {})
+    if model is None or not model:
+        models.pop(provider, None)
+    else:
+        models[provider] = model
+    doc["models"] = models
+    write(doc)
+
+
 # ── Active-providers helpers ───────────────────────────────────────────
 
 # Features the UI configures. Order matters only for display; iteration

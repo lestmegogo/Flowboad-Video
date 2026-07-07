@@ -7,9 +7,8 @@ where needed) so no real CLI / network is hit.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-import httpx
 import pytest
 
 from flowboard.services.llm import registry, secrets
@@ -35,21 +34,23 @@ def _reset_provider_caches():
 # ── GET /api/llm/providers ────────────────────────────────────────────
 
 
-def test_list_providers_returns_all_three(client, tmp_secrets_path):
-    """All 3 registered providers (Claude / Gemini / OpenAI) appear with
-    expected fields. xAI Grok was dropped — never shipped a usable CLI."""
+def test_list_providers_returns_all_four(client, tmp_secrets_path):
+    """All 4 registered providers (Claude / Gemini / OpenAI / 9Router) appear with
+    expected fields."""
     with patch.object(
         registry._PROVIDERS["claude"], "is_available", return_value=False
     ), patch.object(
         registry._PROVIDERS["gemini"], "is_available", return_value=False
     ), patch.object(
         registry._PROVIDERS["openai"], "is_available", return_value=False
+    ), patch.object(
+        registry._PROVIDERS["nine_router"], "is_available", return_value=False
     ):
         resp = client.get("/api/llm/providers")
     assert resp.status_code == 200
     by_name = {p["name"]: p for p in resp.json()}
-    assert set(by_name) == {"claude", "gemini", "openai"}
-    for name in ("claude", "gemini", "openai"):
+    assert set(by_name) == {"claude", "gemini", "openai", "nine_router"}
+    for name in ("claude", "gemini", "openai", "nine_router"):
         entry = by_name[name]
         assert "available" in entry
         assert "configured" in entry
@@ -58,15 +59,13 @@ def test_list_providers_returns_all_three(client, tmp_secrets_path):
         assert "mode" in entry
 
 
-def test_list_providers_no_provider_requires_key_by_default(
+def test_list_providers_all_providers_require_keys(
     client, tmp_secrets_path
 ):
-    """All three shipped providers are CLI-first. OpenAI has an API
-    fallback but its `requiresKey=false` means the CLI path is enough on
-    its own — no provider forces the user to enter a key."""
+    """All providers require API keys now."""
     resp = client.get("/api/llm/providers")
     for entry in resp.json():
-        assert entry["requiresKey"] is False
+        assert entry["requiresKey"] is True
 
 
 def test_list_providers_does_not_leak_api_keys(client, tmp_secrets_path):
@@ -80,8 +79,7 @@ def test_list_providers_does_not_leak_api_keys(client, tmp_secrets_path):
 
 
 def test_set_openai_api_key_clear_path(client, tmp_secrets_path):
-    """apiKey=null clears a previously-saved OpenAI key — the only
-    provider that accepts API keys via this endpoint."""
+    """apiKey=null clears a previously-saved OpenAI key."""
     secrets.set_api_key("openai", "sk-existing")
     resp = client.put("/api/llm/providers/openai", json={"apiKey": None})
     assert resp.status_code == 200
@@ -94,14 +92,14 @@ def test_set_openai_api_key(client, tmp_secrets_path):
     assert secrets.get_api_key("openai") == "sk-new"
 
 
-def test_set_key_for_cli_only_provider_returns_400(client, tmp_secrets_path):
-    """Claude doesn't accept API keys — UI shouldn't post here, but backend
-    must reject if it does."""
+def test_set_key_for_all_providers_succeeds(client, tmp_secrets_path):
+    """All providers accept API keys now."""
     resp = client.put("/api/llm/providers/claude", json={"apiKey": "xyz"})
-    assert resp.status_code == 400
-    assert "doesn't accept API keys" in resp.json()["detail"]
+    assert resp.status_code == 200
+    assert secrets.get_api_key("claude") == "xyz"
     resp = client.put("/api/llm/providers/gemini", json={"apiKey": "xyz"})
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    assert secrets.get_api_key("gemini") == "xyz"
 
 
 def test_set_key_for_unknown_provider_returns_404(client, tmp_secrets_path):
@@ -111,19 +109,71 @@ def test_set_key_for_unknown_provider_returns_404(client, tmp_secrets_path):
 
 def test_setting_key_invalidates_provider_cache(client, tmp_secrets_path):
     """After saving a key, the next /providers call must reflect the new
-    state immediately — not wait for the 60s availability cache. OpenAI
-    is the only provider that accepts API keys; verify its cache is
-    reset on key save."""
+    state immediately — not wait for the 60s availability cache."""
     openai = registry._PROVIDERS["openai"]
-    openai._cli_available = True  # type: ignore[attr-defined]
+    openai._api_cached_at = 1234.5  # type: ignore[attr-defined]
     resp = client.put("/api/llm/providers/openai", json={"apiKey": "sk-1"})
     assert resp.status_code == 200
-    # reset_cache() flips _cli_available back to False so the next probe
-    # re-runs the CLI version check.
-    assert openai._cli_available is False  # type: ignore[attr-defined]
+    assert openai._api_cached_at is None  # type: ignore[attr-defined]
 
 
 # ── POST /api/llm/providers/{name}/test ───────────────────────────────
+
+
+def test_set_and_clear_provider_model(client, tmp_secrets_path):
+    response = client.put(
+        "/api/llm/providers/nine_router/model",
+        json={"model": "GEMINI"},
+    )
+    assert response.status_code == 200
+    assert secrets.get_model("nine_router") == "GEMINI"
+
+    response = client.put(
+        "/api/llm/providers/nine_router/model",
+        json={"model": None},
+    )
+    assert response.status_code == 200
+    assert secrets.get_model("nine_router") is None
+
+
+def test_set_model_for_unknown_provider_returns_404(
+    client, tmp_secrets_path
+):
+    response = client.put(
+        "/api/llm/providers/unknown/model",
+        json={"model": "anything"},
+    )
+    assert response.status_code == 404
+
+
+def test_list_provider_models_uses_provider_implementation(
+    client, tmp_secrets_path
+):
+    provider = registry._PROVIDERS["nine_router"]
+    with patch.object(
+        provider,
+        "list_models",
+        return_value=["GEMINI", "Codex-GPT"],
+    ):
+        response = client.get("/api/llm/providers/nine_router/models")
+
+    assert response.status_code == 200
+    assert response.json() == ["GEMINI", "Codex-GPT"]
+
+
+def test_list_provider_models_has_static_fallback(
+    client, tmp_secrets_path
+):
+    response = client.get("/api/llm/providers/claude/models")
+    assert response.status_code == 200
+    assert "claude-3-5-sonnet-latest" in response.json()
+
+
+def test_provider_list_includes_selected_model(client, tmp_secrets_path):
+    secrets.set_model("nine_router", "GEMINI")
+    response = client.get("/api/llm/providers")
+    by_name = {item["name"]: item for item in response.json()}
+    assert by_name["nine_router"]["selectedModel"] == "GEMINI"
 
 
 def test_test_endpoint_reports_success_with_latency(client, tmp_secrets_path):

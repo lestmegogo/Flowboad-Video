@@ -151,7 +151,8 @@ export function ActivityTypeIcon({
     case "auto_prompt_batch": return <SparklesStackIcon size={size} className={className} />;
     case "planner":           return <MessageIcon size={size} className={className} />;
     case "gen_image":         return <ImageIcon size={size} className={className} />;
-    case "gen_video":         return <VideoIcon size={size} className={className} />;
+    case "gen_video":
+    case "compose_video":     return <VideoIcon size={size} className={className} />;
     case "edit_image":        return <EditIcon size={size} className={className} />;
     case "upload":            return <UploadIcon size={size} className={className} />;
     case "upload_url":        return <LinkIcon size={size} className={className} />;

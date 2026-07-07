@@ -13,6 +13,7 @@ const CHIPS: Chip[] = [
   { type: "image", icon: "▣", label: "Image" },
   { type: "Storyboard", icon: "▦", label: "Storyboard" },
   { type: "video", icon: "▶", label: "Video" },
+  { type: "video_composer", icon: "⏩", label: "Composer" },
   { type: "visual_asset", icon: "◇", label: "Visual asset" },
   { type: "prompt", icon: "✦", label: "Prompt" },
   { type: "note", icon: "✎", label: "Note" },

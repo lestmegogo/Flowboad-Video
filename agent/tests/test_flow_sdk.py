@@ -1,7 +1,9 @@
 """Tests for the minimal Flow SDK. Uses a recording fake FlowClient so we can
 assert on the JSON-RPC shape without touching a real WS.
 """
+import base64
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -12,6 +14,7 @@ from flowboard.services.flow_sdk import (
     _extract_media_ids,
     extract_media_entries,
     extract_operation_names,
+    extract_project_media_states,
     extract_video_operations,
     extract_video_workflows,
 )
@@ -31,6 +34,12 @@ class RecordingClient:
     async def trpc_request(self, **kwargs):
         self.trpc_calls.append(kwargs)
         return self.trpc_response
+
+
+def _mp4_bytes(size: int = 64) -> bytes:
+    """Synthetic but valid-looking MP4: ``ftyp`` box at offset 4."""
+    header = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
+    return header + b"\x00" * (size - len(header))
 
 
 def _make_project_response(project_id: str = "proj-123") -> dict:
@@ -87,6 +96,32 @@ async def test_create_project_surfaces_error_when_id_missing():
 
 
 @pytest.mark.asyncio
+async def test_create_project_surfaces_nested_trpc_auth_error():
+    c = RecordingClient()
+    c.trpc_response = {
+        "status": 401,
+        "data": {
+            "error": {
+                "json": {
+                    "message": "Unauthorized",
+                    "code": -32001,
+                    "data": {
+                        "code": "UNAUTHORIZED",
+                        "httpStatus": 401,
+                    },
+                }
+            }
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.create_project("x")
+
+    assert "project_id" not in out
+    assert out["error"] == "FLOW_AUTH_REQUIRED: Unauthorized"
+
+
+@pytest.mark.asyncio
 async def test_create_project_passes_extension_error_through():
     c = RecordingClient()
     c.trpc_response = {"error": "extension_disconnected"}
@@ -94,6 +129,60 @@ async def test_create_project_passes_extension_error_through():
     out = await sdk.create_project("x")
     assert out["error"] == "extension_disconnected"
     assert out["raw"] == {"error": "extension_disconnected"}
+
+
+@pytest.mark.asyncio
+async def test_upload_image_retries_after_auth_refresh():
+    media_id = "11111111-2222-3333-4444-555555555555"
+
+    class RefreshingClient(RecordingClient):
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            if len(self.api_calls) == 1:
+                return {"status": 503, "error": "AUTH_REFRESHED_RETRY"}
+            return {
+                "status": 200,
+                "data": {"media": {"name": media_id}},
+            }
+
+    c = RefreshingClient()
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.upload_image(
+        image_base64="aW1hZ2U=",
+        mime_type="image/jpeg",
+        project_id="proj-123",
+        file_name="image.jpg",
+    )
+
+    assert len(c.api_calls) == 2
+    assert out["media_id"] == media_id
+
+
+@pytest.mark.asyncio
+async def test_upload_image_surfaces_inner_auth_error():
+    c = RecordingClient()
+    c.api_response = {
+        "status": 401,
+        "data": {
+            "error": {
+                "code": 401,
+                "message": "Request had invalid authentication credentials.",
+                "status": "UNAUTHENTICATED",
+            }
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.upload_image(
+        image_base64="aW1hZ2U=",
+        mime_type="image/jpeg",
+        project_id="proj-123",
+        file_name="image.jpg",
+    )
+
+    assert "media_id" not in out
+    assert out["error"] == "Request had invalid authentication credentials."
 
 
 @pytest.mark.asyncio
@@ -700,18 +789,60 @@ def test_extract_inner_api_error_handles_status_only():
     assert err == "API_503"
 
 
+def test_extract_project_media_states_reads_generation_status():
+    resp = {
+        "status": 200,
+        "data": {
+            "result": {
+                "data": {
+                    "json": {
+                        "projectContents": {
+                            "media": [
+                                {
+                                    "name": "mid-pending",
+                                    "mediaMetadata": {
+                                        "mediaStatus": {
+                                            "mediaGenerationStatus": (
+                                                "MEDIA_GENERATION_STATUS_SCHEDULED"
+                                            )
+                                        }
+                                    },
+                                },
+                                {
+                                    "name": "mid-failed",
+                                    "mediaMetadata": {
+                                        "mediaStatus": {
+                                            "mediaGenerationStatus": (
+                                                "MEDIA_GENERATION_STATUS_FAILED"
+                                            ),
+                                            "reason": (
+                                                "PUBLIC_ERROR_UNSAFE_GENERATION"
+                                            ),
+                                        }
+                                    },
+                                },
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+    }
+    states = extract_project_media_states(resp)
+    assert states["mid-pending"] == {
+        "status": "MEDIA_GENERATION_STATUS_SCHEDULED",
+        "error": None,
+    }
+    assert states["mid-failed"] == {
+        "status": "MEDIA_GENERATION_STATUS_FAILED",
+        "error": "PUBLIC_ERROR_UNSAFE_GENERATION",
+    }
+
+
 # ── workflow-mode (Low Priority) video schema ─────────────────────────────
-# Some Veo checkpoints (e.g. ``veo_3_1_i2v_lite_low_priority``,
-# ``veo_3_1_i2v_s_fast_ultra_relaxed``) return ``data.workflows[]`` instead
-# of ``data.operations[]``, and the final MP4 is fetched inline as base64
-# from ``/v1/media/<id>`` rather than streamed off ``fifeUrl``. The SDK
-# auto-detects the schema and routes the poll accordingly.
-
-
-def _mp4_bytes(size: int = 64) -> bytes:
-    """Synthetic but valid-looking MP4: ``ftyp`` box at offset 4 (12+ bytes)."""
-    header = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
-    return header + b"\x00" * (size - len(header))
+# Some video checkpoints return ``data.workflows[]`` instead of
+# ``data.operations[]``. Flow's UI resolves completed workflow media through
+# ``media.getMediaUrlRedirect``; the SDK mirrors that contract.
 
 
 def test_extract_operation_names_handles_workflow_schema():
@@ -738,8 +869,37 @@ def test_extract_video_workflows_returns_pairs():
         }
     }
     assert extract_video_workflows(resp) == [
-        {"name": "wf-1", "primary_media_id": "mid-1"},
-        {"name": "wf-2", "primary_media_id": "mid-2"},
+        {"name": "wf-1", "primary_media_id": "mid-1", "project_id": None},
+        {"name": "wf-2", "primary_media_id": "mid-2", "project_id": None},
+    ]
+
+
+def test_extract_video_workflows_pairs_media_when_primary_metadata_missing():
+    resp = {
+        "data": {
+            "workflows": [
+                {
+                    "name": "wf-client-generated",
+                    "metadata": {"displayName": "Pending video"},
+                    "projectId": "project-1",
+                }
+            ],
+            "media": [
+                {
+                    "name": "mid-server-generated",
+                    "workflowId": "wf-client-generated",
+                    "projectId": "project-1",
+                }
+            ],
+        }
+    }
+
+    assert extract_video_workflows(resp) == [
+        {
+            "name": "wf-client-generated",
+            "primary_media_id": "mid-server-generated",
+            "project_id": "project-1",
+        }
     ]
 
 
@@ -767,31 +927,26 @@ async def test_gen_video_surfaces_workflows_on_low_priority_response():
         paygate_tier="PAYGATE_TIER_TWO", video_quality="lite_relaxed",
     )
     assert out["operation_names"] == ["wf-uuid"]
-    assert out["workflows"] == [{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}]
+    assert out["workflows"] == [{"name": "wf-uuid", "primary_media_id": "primary-vid-1", "project_id": None}]
     # Old "no_operations_in_response" path must NOT trigger on workflow shape.
     assert "error" not in out
 
 
 @pytest.mark.asyncio
 async def test_check_async_workflow_mode_polls_media_endpoint():
-    """Workflow polling fetches ``/v1/media/<id>`` and reads base64 MP4 off
-    ``video.encodedVideo``. A response with valid ``ftyp`` magic → done."""
-    import base64 as _b64
-
-    class WorkflowClient(RecordingClient):
-        async def api_request(self, **kwargs):
-            self.api_calls.append(kwargs)
-            return {
-                "status": 200,
-                "data": {
-                    "video": {
-                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
-                        "fifeUrl": "https://flow-content.google/video/primary-vid-1?sig=x",
-                    }
-                },
-            }
-
-    c = WorkflowClient()
+    """Workflow polling first fetches inline MP4 from /v1/media/<id>."""
+    c = RecordingClient()
+    c.api_response = {
+        "status": 200,
+        "data": {
+            "video": {
+                "encodedVideo": base64.b64encode(_mp4_bytes()).decode(),
+                "fifeUrl": (
+                    "https://flow-content.google/video/primary-vid-1?sig=x"
+                ),
+            },
+        },
+    }
     sdk = FlowSDK(client=c)  # type: ignore[arg-type]
     out = await sdk.check_async(
         ["wf-uuid"],
@@ -803,32 +958,19 @@ async def test_check_async_workflow_mode_polls_media_endpoint():
     assert ops[0]["done"] is True
     assert ops[0]["media_entries"][0]["media_id"] == "primary-vid-1"
     assert ops[0]["media_entries"][0]["mediaType"] == "video"
-    # The encoded video bytes ride along so the processor can plant them
-    # in the local cache (no GCS URL to fall back to).
+    assert ops[0]["media_entries"][0]["url"].startswith(
+        "https://flow-content.google/"
+    )
     assert "encoded_video" in ops[0]["media_entries"][0]
-    # GET against /v1/media/<id> — never POST batchCheckAsync for a workflow.
     assert c.api_calls[0]["method"] == "GET"
     assert "/v1/media/primary-vid-1" in c.api_calls[0]["url"]
+    assert c.trpc_calls == []
 
 
 @pytest.mark.asyncio
-async def test_check_async_workflow_mode_partial_bytes_means_pending():
-    """During render Flow returns a small metadata payload (no ``ftyp``
-    magic). That must register as ``done=False`` so the worker keeps
-    polling — not a spurious success on a 0-byte file."""
-    import base64 as _b64
-
-    class WorkflowClient(RecordingClient):
-        async def api_request(self, **kwargs):
-            self.api_calls.append(kwargs)
-            return {
-                "status": 200,
-                "data": {
-                    "video": {"encodedVideo": _b64.b64encode(b"\x00" * 200).decode()}
-                },
-            }
-
-    c = WorkflowClient()
+async def test_check_async_workflow_mode_missing_redirect_means_pending():
+    c = RecordingClient()
+    c.trpc_response = {"status": 200, "data": {"redirectUrl": None}}
     sdk = FlowSDK(client=c)  # type: ignore[arg-type]
     out = await sdk.check_async(
         ["wf-uuid"],
@@ -839,39 +981,241 @@ async def test_check_async_workflow_mode_partial_bytes_means_pending():
 
 
 @pytest.mark.asyncio
+async def test_check_async_workflow_mode_generic_400_means_pending():
+    """Omni can return INVALID_ARGUMENT briefly while rendering continues."""
+    c = RecordingClient()
+    c.trpc_response = {
+        "status": 400,
+        "data": {
+            "error": {
+                "status": "INVALID_ARGUMENT",
+                "message": "Request contains an invalid argument.",
+            }
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-uuid"],
+        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+    )
+    op = out["operations"][0]
+    assert op["done"] is False
+    assert op["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_persisted_as_scheduled_ignores_not_found_probe():
+    class _Client(RecordingClient):
+        async def trpc_request(self, **kwargs):
+            self.trpc_calls.append(kwargs)
+            if "projectInitialData" in kwargs["url"]:
+                return {
+                    "status": 200,
+                    "data": {
+                        "result": {
+                            "data": {
+                                "json": {
+                                    "projectContents": {
+                                        "media": [
+                                            {
+                                                "name": "mid-scheduled",
+                                                "mediaMetadata": {
+                                                    "mediaStatus": {
+                                                        "mediaGenerationStatus": (
+                                                            "MEDIA_GENERATION_STATUS_SCHEDULED"
+                                                        )
+                                                    }
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+            return {"status": 404, "data": {}}
+
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            if "/v1/media/" in kwargs["url"]:
+                return {"status": 404, "data": {}}
+            raise AssertionError(
+                "persisted scheduled media must not use failure probe"
+            )
+
+    sdk = FlowSDK(client=_Client())  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-scheduled"],
+        workflows=[
+            {
+                "name": "wf-scheduled",
+                "primary_media_id": "mid-scheduled",
+                "project_id": "project-1",
+            }
+        ],
+    )
+    op = out["operations"][0]
+    assert op["done"] is False
+    assert op["status"] == "MEDIA_GENERATION_STATUS_SCHEDULED"
+    assert "failure_candidate" not in op
+
+
+@pytest.mark.asyncio
+async def test_missing_workflow_stays_pending_without_operation_probe():
+    class _Client(RecordingClient):
+        async def trpc_request(self, **kwargs):
+            self.trpc_calls.append(kwargs)
+            if "projectInitialData" in kwargs["url"]:
+                return {
+                    "status": 200,
+                    "data": {
+                        "result": {
+                            "data": {
+                                "json": {
+                                    "projectContents": {"media": []}
+                                }
+                            }
+                        }
+                    },
+                }
+            return {"status": 404, "data": {}}
+
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            assert "/v1/media/" in kwargs["url"]
+            return {"status": 404, "data": {}}
+
+    client = _Client()
+    sdk = FlowSDK(client=client)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-missing"],
+        workflows=[
+            {
+                "name": "wf-missing",
+                "primary_media_id": "mid-missing",
+                "project_id": "project-1",
+            }
+        ],
+    )
+    op = out["operations"][0]
+    assert op["done"] is False
+    assert op["status"] is None
+    assert op["error"] is None
+    assert op["missing_in_project"] is True
+    assert "workflow_probe_error" not in op
+    assert "failure_candidate" not in op
+    assert all("batchCheckAsyncVideoGenerationStatus" not in call["url"] for call in client.api_calls)
+
+
+@pytest.mark.asyncio
+async def test_missing_workflow_does_not_probe_batch_check_for_public_error():
+    class _Client(RecordingClient):
+        async def trpc_request(self, **kwargs):
+            self.trpc_calls.append(kwargs)
+            if "projectInitialData" in kwargs["url"]:
+                return {
+                    "status": 200,
+                    "data": {
+                        "result": {
+                            "data": {
+                                "json": {
+                                    "projectContents": {"media": []}
+                                }
+                            }
+                        }
+                    },
+                }
+            return {"status": 404, "data": {}}
+
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            assert "/v1/media/" in kwargs["url"]
+            return {"status": 404, "data": {}}
+
+    client = _Client()
+    sdk = FlowSDK(client=client)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-rejected"],
+        workflows=[
+            {
+                "name": "wf-rejected",
+                "primary_media_id": "mid-missing",
+                "project_id": "project-1",
+            }
+        ],
+    )
+    op = out["operations"][0]
+    assert op["done"] is False
+    assert op["status"] is None
+    assert "failure_candidate" not in op
+    assert all("batchCheckAsyncVideoGenerationStatus" not in call["url"] for call in client.api_calls)
+
+
+@pytest.mark.asyncio
+async def test_check_async_workflow_mode_content_filter_is_terminal():
+    c = RecordingClient()
+    c.trpc_response = {
+        "status": 400,
+        "data": {
+            "error": {
+                "status": "INVALID_ARGUMENT",
+                "message": "Request contains an invalid argument.",
+                "details": [
+                    {"reason": "PUBLIC_ERROR_UNSAFE_GENERATION"}
+                ],
+            }
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-uuid"],
+        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+    )
+    op = out["operations"][0]
+    assert op["done"] is True
+    assert "PUBLIC_ERROR_UNSAFE_GENERATION" in op["error"]
+
+
+@pytest.mark.asyncio
 async def test_check_async_mixed_schemas_routes_correctly():
     """A single batch can mix OLD operations and NEW workflows (e.g. when a
     retry of a workflow op is re-dispatched as workflow). Operation names
     must NOT be sent into the workflow poll and vice-versa."""
-    import base64 as _b64
-
     class MixedClient(RecordingClient):
         async def api_request(self, **kwargs):
             self.api_calls.append(kwargs)
-            url = kwargs.get("url", "")
-            if "batchCheckAsync" in url:
-                return {
-                    "status": 200,
-                    "data": {
-                        "operations": [
-                            {
-                                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
-                                "operation": {
-                                    "name": "op-old",
-                                    "metadata": {"video": {"mediaId": "old-mid", "fifeUrl": "https://flow-content.google/video/old-mid?sig"}},
-                                },
-                            }
-                        ]
-                    },
-                }
-            # /v1/media/<id> path
             return {
                 "status": 200,
                 "data": {
-                    "video": {
-                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
-                        "fifeUrl": "https://flow-content.google/video/wf-mid?sig",
-                    }
+                    "operations": [
+                        {
+                            "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                            "operation": {
+                                "name": "op-old",
+                                "metadata": {
+                                    "video": {
+                                        "mediaId": "old-mid",
+                                        "fifeUrl": (
+                                            "https://flow-content.google/"
+                                            "video/old-mid?sig"
+                                        ),
+                                    }
+                                },
+                            },
+                        }
+                    ]
+                }
+            }
+
+        async def trpc_request(self, **kwargs):
+            self.trpc_calls.append(kwargs)
+            return {
+                "status": 200,
+                "data": {
+                    "redirectUrl": (
+                        "https://flow-content.google/video/wf-mid?sig"
+                    )
                 },
             }
 
@@ -890,6 +1234,62 @@ async def test_check_async_mixed_schemas_routes_correctly():
     old_call = next(c for c in c.api_calls if "batchCheckAsync" in c.get("url", ""))
     bodies = old_call["body"]["operations"]
     assert [b["operation"]["name"] for b in bodies] == ["op-old"]
+    assert len(c.trpc_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_gen_video_omni_registers_workflow_in_request_metadata():
+    c = RecordingClient()
+    c.api_response = {
+        "status": 200,
+        "data": {
+            "workflows": [
+                {
+                    "name": "wf-server",
+                    "metadata": {"primaryMediaId": "mid-server"},
+                    "projectId": "project-1",
+                }
+            ]
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.gen_video_omni(
+        prompt="subtle movement",
+        project_id="project-1",
+        ref_media_ids=["ref-1"],
+        duration_s=10,
+        paygate_tier="PAYGATE_TIER_ONE",
+    )
+
+    request_item = c.api_calls[0]["body"]["requests"][0]
+    assert UUID(request_item["metadata"]["workflowId"]).version == 4
+    assert "resolution" not in request_item
+    assert request_item["referenceImages"] == [
+        {
+            "mediaId": "ref-1",
+            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+        }
+    ]
+    assert out["workflows"] == [
+        {
+            "name": "wf-server",
+            "primary_media_id": "mid-server",
+            "project_id": "project-1",
+        }
+    ]
+    assert len(c.api_calls) == 2
+    update_call = c.api_calls[1]
+    assert update_call["url"].endswith("/v1/flowWorkflows/wf-server")
+    assert update_call["method"] == "PATCH"
+    assert update_call["body"] == {
+        "workflow": {
+            "name": "wf-server",
+            "projectId": "project-1",
+            "metadata": {"primaryMediaId": "mid-server"},
+        },
+        "updateMask": "metadata.primaryMediaId",
+    }
 
 
 @pytest.mark.asyncio
@@ -899,7 +1299,6 @@ async def test_gen_image_propagates_prominent_people_filter():
     `failed`. Verify the SDK surfaces an `error` key for the worker."""
     client = RecordingClient()
     client.api_response = {
-        "id": "x",
         "status": 400,
         "data": {
             "error": {
@@ -919,3 +1318,39 @@ async def test_gen_image_propagates_prominent_people_filter():
     assert "error" in out
     assert "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in out["error"]
     assert "media_ids" not in out
+
+
+@pytest.mark.asyncio
+async def test_gen_video_omni_normalizes_aspect_ratio():
+    c = RecordingClient()
+    c.api_response = {
+        "status": 200,
+        "data": {
+            "workflows": [
+                {
+                    "name": "wf-server-1",
+                    "metadata": {"primaryMediaId": "mid-server-1"},
+                    "projectId": "project-1",
+                }
+            ]
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    await sdk.gen_video_omni(
+        prompt="movement",
+        project_id="project-1",
+        ref_media_ids=["ref-1"],
+        duration_s=6,
+        aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
+        paygate_tier="PAYGATE_TIER_ONE",
+    )
+
+    request_item = c.api_calls[0]["body"]["requests"][0]
+    assert request_item["aspectRatio"] == "VIDEO_ASPECT_RATIO_LANDSCAPE"
+
+
+def test_resolve_video_model_normalizes_aspect_ratio():
+    from flowboard.services.flow_sdk import resolve_video_model
+    key = resolve_video_model("PAYGATE_TIER_ONE", "IMAGE_ASPECT_RATIO_LANDSCAPE", "fast")
+    assert key == "veo_3_1_i2v_s_fast"

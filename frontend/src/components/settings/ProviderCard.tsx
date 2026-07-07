@@ -30,9 +30,10 @@ const PROVIDER_META: Record<
   LLMProviderName,
   { name: string; tagline: string }
 > = {
-  claude:  { name: "Claude Code",   tagline: "Anthropic CLI · OAuth" },
-  gemini:  { name: "Gemini CLI",    tagline: "Google CLI · OAuth" },
-  openai:  { name: "OpenAI Codex",  tagline: "ChatGPT CLI · OAuth" },
+  claude:  { name: "Claude",        tagline: "Anthropic API Key" },
+  gemini:  { name: "Gemini",        tagline: "Google API Key" },
+  openai:  { name: "OpenAI",        tagline: "OpenAI API Key" },
+  nine_router: { name: "9Router Proxy", tagline: "9Router API Key" },
 };
 
 function statusLabel(p: LLMProviderInfo): string {

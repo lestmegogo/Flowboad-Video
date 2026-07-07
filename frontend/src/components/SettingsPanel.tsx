@@ -225,7 +225,7 @@ export function SettingsPanel({ open, onClose, onLogout, logoutPending }: Settin
               </div>
               <div className="settings-panel__radio-hint">
                 Reference-image to video. Variable duration (4 / 6 / 8 / 10s)
-                picked per dispatch — 15 / 20 / 25 / 30 credits. Portrait +
+                picked per dispatch - 7 / 10 / 12 / 15 credits. Portrait +
                 landscape supported.
               </div>
             </div>
